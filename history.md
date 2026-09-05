@@ -4,6 +4,95 @@ Running changelog. Newest entry first. Each entry is a short brief; the full
 reference lives in [documentation.md](documentation.md) and
 [architecture.md](architecture.md).
 
+## 2026-09-05 — Simulate tab: escalation is not a hard stop + voice-input removed
+
+- **Did:** The user asked: if a query is escalated to a human, the agent
+  should still answer customer queries as long as they're in scope — e.g. a
+  customer who agrees to pay right after an escalation should still get help
+  with a payment link (unless the case was a suspected-fraud halt, which
+  should stay a genuine hard stop). Clarified with the user across a few
+  rounds: (1) applies to every escalation reason except `halted`; (2) the
+  ticket/outcome badge stays "Escalated — Human Review" while the AI keeps
+  chatting underneath, only moving to `ptp_pending`/`recovered` on a real new
+  outcome; (3) Next Turn/Auto-Run (not just manual chat) should also keep
+  working, since they're just simulation controls, not a policy boundary.
+  Traced the actual code before changing anything: the S10 PTP state machine
+  (from the prior round) already lets a same-turn `ptp_promised`/`resolved`
+  outcome win over the escalation ceiling, and `phase==='ended'` already
+  rendered the full 4-column UI regardless — the only thing actually locking
+  the conversation was `SimulateSession.tsx`'s `isActionable` flag excluding
+  `"escalated"` outright. Changed it from `outcome==='ongoing'||'ptp_promised'`
+  to `outcome!=='resolved' && outcome!=='halted'` — zero backend changes
+  needed. Separately, mid-turn the user asked to "remove the voice in the
+  whatsapp chat": removed the mic button from the WhatsApp chat input bar,
+  then found and deleted the entire now-fully-dead `SpeechRecognition`
+  apparatus it was the last entry point for (interfaces, `getSpeechRecognition`,
+  `startListening`/`stopListening`, `isListening`/`speechSupported` state,
+  `recognitionRef`) — voice playback was already gated to `channel==='call'`,
+  permanently unreachable since an earlier fix forces `begin()` to always
+  request `channel: 'message'`.
+- **Verified:** No Razorpay API surface touched — pure frontend UI-state and
+  dead-code changes.
+- **Docs:** `documentation.md` (top changelog, `SimulateSession.tsx` row),
+  `architecture.md` (top changelog, §7 component row, §8 two new decision
+  rows), `plan.md` §12 — all updated in this pass.
+- **Tests:** `npm run build` (frontend) clean. No backend changes this round,
+  so the existing 86-test `test_playground.py`/`test_api.py` suite is
+  unaffected (not re-run).
+- **Next:** Still no manual click-through in a running dev server. The user
+  separately asked about pushing this branch (`main`, already has `origin`
+  set to `Space-Fighter/AI-Revenue-Recovery`) for a friend to test — not done
+  yet, pending explicit confirmation before pushing to the shared repo.
+
+---
+
+## 2026-09-05 — Simulate tab: bare-agreement override + bot-question fix
+
+- **Did:** The user pasted a follow-up transcript showing the S10 fix wasn't
+  enough: the customer replied "okay" in direct response to the agent's own
+  "should I send you the payment link?" — an unambiguous agreement — but the
+  case never became a PTP at all, and instead kept accumulating attempts
+  until the generic `max_attempts_exceeded` ceiling escalated it. Root cause:
+  this deployment has `OPENROUTER_API_KEY` configured, so conversations run
+  through the LLM path, and the deterministic agreement-detection that would
+  have caught "okay" only lived inside `_fallback_agent_reply` — never
+  consulted once an LLM call succeeded, so the model's own (in this case,
+  wrong) judgment simply overwrote it. Also flagged: an off-topic "Are you a
+  bot?" got the exact same recycled "browser session dropped" explanation as
+  a genuine failure question, because the fallback's question-detection fired
+  on any bare `"?"`; and the "Reminders Cap: 3/3" badge looked contradictory
+  because it was computed from an unrelated heuristic (`Math.min(3, sim_day)`),
+  not the real S10 cadence state. Dispatched `simulation-engine-builder` for
+  `backend/app/agents/playground.py`: extracted `_is_clear_agreement` (same
+  semantics the fallback already used) and added `_apply_agreement_override`,
+  run after every LLM call (success or fallback) in both `send_message` and
+  `advance_conversation`, before the S10 state machine — if the outcome is
+  still `"ongoing"` and the message is an unambiguous agreement, force-correct
+  to `"ptp_promised"` regardless of the model's own decision (never applied to
+  the `speaker="agent"` human-takeover path, which stays fully trusted).
+  Separately, added an identity/bot-detection branch (`_IDENTITY_WORDS`) to
+  the fallback and narrowed the failure-explanation branch to require an
+  actual on-topic signal (`_QUESTION_WORDS` hit, or `"?"` plus a
+  `_FAILURE_DOMAIN_WORDS` hit) instead of firing on any bare `"?"`. Fixed the
+  frontend's `renderRemindersMetric` (`SimulateSession.tsx`) to read the real
+  `sim_state.reminder_days.length` instead of guessing from `sim_day`, with a
+  "paused (PTP)" note during a promise wait.
+- **Verified:** No new Razorpay API surface — purely conversational-logic and
+  UI-state fixes inside the already-sandboxed rehearsal agent.
+- **Docs:** `AGENTS_CONTRACT.md` §13 (new entries S11a/S11b), `documentation.md`
+  (`playground.py` and `SimulateSession.tsx` rows, top changelog),
+  `architecture.md` (§8 three new decision rows, top changelog), `plan.md`
+  §12 — all updated in this pass.
+- **Tests:** `uv run pytest tests/test_playground.py tests/test_api.py -q` →
+  86 passed (6 new in `test_playground.py`). `npm run build` (frontend) clean.
+- **Next:** Still no manual click-through in a running dev server. Worth
+  watching for in a future session: whether `_apply_agreement_override`'s
+  "not also a question" guard is strict enough across more real LLM-generated
+  customer phrasing (it was only tested against the specific patterns already
+  in `_AGREE_PHRASES`/the bare-word set, not a broader LLM-generated corpus).
+
+---
+
 ## 2026-09-05 — Simulate tab: PTP escalation bugfix + reminder cadence
 
 - **Did:** The user pasted a live rehearsal transcript and caught a real bug

@@ -558,6 +558,56 @@ This project is being built *for* Razorpay, evaluated *by* Razorpay engineers, o
   recorded, making it impossible to ever watch a promise resolve or go
   overdue). 64 backend tests green (`test_playground.py`, 15 new); full
   `documentation.md`/`architecture.md` deltas applied same-pass.
+- **Simulate tab: bare-agreement override + bot-question fix (2026-09-05):**
+  this deployment runs with `OPENROUTER_API_KEY` configured, so conversations
+  are LLM-driven — and a follow-up live transcript exposed a gap the S10 fix
+  didn't cover: the customer replied "okay" to the agent's own "should I send
+  you the payment link?", an unambiguous agreement, but the LLM's own
+  judgment didn't classify it as such, so the case never became a PTP at all
+  and instead kept accumulating attempts until the generic
+  `max_attempts_exceeded` ceiling fired — the S10 fix only protects a PTP
+  *after* it's recorded, not the recognition step itself. Fixed with
+  `_apply_agreement_override` (`backend/app/agents/playground.py`,
+  `AGENTS_CONTRACT.md` §13 new entries S11a/S11b): runs after every LLM call
+  in both `send_message` and `advance_conversation`, and if the outcome is
+  still `"ongoing"` while the message is an unambiguous agreement
+  (`_is_clear_agreement`, same semantics the deterministic fallback already
+  used, now shared/extracted), force-corrects to `"ptp_promised"` regardless
+  of the model's own judgment — cheap insurance, costs nothing when the model
+  already agrees, never applied to the human-takeover path. Same transcript
+  also showed an off-topic "Are you a bot?" getting the same recycled
+  root-cause-explanation text as a genuine failure question, because the
+  fallback's question-detection fired on any bare `"?"`; fixed with a new
+  identity-question branch and a requirement that the explanation branch see
+  an actual on-topic signal. Also fixed the frontend's "Reminders Cap: X/3"
+  badge (`SimulateSession.tsx`), previously a `Math.min(3, sim_day)` guess
+  disconnected from the real S10 cadence state — now reads
+  `sim_state.reminder_days.length`. 86 backend tests green
+  (`test_playground.py`, 6 new); full `documentation.md`/`architecture.md`
+  deltas applied same-pass.
+- **Simulate tab: escalation is not a hard stop + voice-input removed
+  (2026-09-05):** the user pointed out that once a case is escalated to
+  human review, the agent should still keep answering customer queries as
+  long as they're in scope — e.g. if the customer suddenly agrees to pay
+  after escalation, the agent should still help with a payment link, exactly
+  like a real support hand-off (a ticket being open doesn't mean the AI goes
+  silent). `SimulateSession.tsx`'s `isActionable` locked the entire
+  conversation (chat, Next Turn, Auto-Run, every panel button) the instant
+  `outcome==='escalated'`; changed to `outcome!=='resolved' &&
+  outcome!=='halted'` — escalation of any reason stays fully interactive,
+  matching the user's explicit call-out that a suspected-fraud `halted` case
+  should remain the one genuine hard stop (Recovery already refuses to act
+  on those). Confirmed this needed **no backend change at all**: the S10 PTP
+  state machine already lets a same-turn `ptp_promised`/`resolved` outcome
+  win over the escalation ceiling, and `phase==='ended'` already rendered the
+  full UI — the lock was purely this one frontend flag. Also removed the
+  voice-input feature per the user's request ("remove the voice in the
+  whatsapp chat") — the mic button lived only in the WhatsApp chat input bar,
+  and voice playback was already gated to `channel==='call'` (permanently
+  unreachable since `begin()` forces `channel: 'message'`), so the entire
+  `SpeechRecognition` apparatus was dead code once that one button was gone;
+  deleted rather than left dormant. `npm run build` clean; no backend tests
+  affected (frontend-only change).
 - **Approved deviations from this brief:** PostgreSQL (not SQLite) — run as a
   local process via `scripts/pg.ps1` since Docker needs WSL2 (unavailable on this
   Win 11 Home box); `uv` (not `pip`/`requirements.txt`); a FastAPI **backend/** +

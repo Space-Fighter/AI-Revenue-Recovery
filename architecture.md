@@ -8,16 +8,46 @@ Diagrams and design rationale. Companion to
 > the same change that alters the architecture, data model, agent flow, or
 > runtime topology.
 
-Last updated: 2026-09-05 — **Simulate tab: PTP escalation bugfix + reminder
+Last updated: 2026-09-05 — **Simulate tab: escalation is not a hard stop +
+voice-input removed** (plan.md §9): a case escalated to human review used to
+lock the entire conversation (`isActionable` excluded `"escalated"`
+entirely), but an open ticket doesn't mean the AI should stop responding — it
+should keep answering in-scope queries, and can still help with a payment
+link if the customer changes their mind, same as a real support hand-off.
+`isActionable` is now `outcome!=='resolved' && outcome!=='halted'` — only an
+actual payment or a fraud/security halt (per the project's existing "Recovery
+refuses to act" policy) ends the conversation. No backend change was needed:
+the S10 state machine already lets `ptp_promised`/`resolved` win over the
+escalation ceiling, and `phase==='ended'` already kept the full UI rendered —
+see §8's new decision row. Also removed the now-fully-dead voice-input
+(`SpeechRecognition`) code from `SimulateSession.tsx` — its only UI entry
+point (a mic button in the WhatsApp input bar) is gone, and voice playback
+was already unreachable since `channel` is permanently `'message'`.
+<!-- previous update: Simulate tab: bare-agreement override + bot-question fix -->
+
+Previously (2026-09-05) — **Simulate tab: bare-agreement override + bot-question
+fix** (plan.md §9, `AGENTS_CONTRACT.md` §13 S11): this deployment runs with an
+LLM key configured, so a live transcript exposed a gap the S10 fix didn't
+cover — the model's own judgment simply didn't treat a bare "okay" (replying
+to the agent's own offer to send a payment link) as agreement, so the case
+never became a PTP at all and instead escalated via the generic attempts
+ceiling. See §8's new decision rows: a deterministic backstop
+(`_apply_agreement_override`) now force-corrects an unambiguous agreement to
+`ptp_promised` regardless of what the LLM decided, and the deterministic
+fallback no longer recycles the same failure-explanation text for an
+unrelated question (e.g. "Are you a bot?"). Also fixed the frontend's
+"Reminders Cap" badge, previously a disconnected heuristic.
+<!-- previous update: Simulate tab: PTP escalation bugfix + reminder cadence -->
+
+Previously (2026-09-05) — **Simulate tab: PTP escalation bugfix + reminder
 cadence** (plan.md §9, `AGENTS_CONTRACT.md` §12/§13 S10): see §6.2's updated
-sequence diagram and §8's new decision rows — a real bug (a same-turn
-`ptp_promised`/`resolved` outcome was being silently clobbered into
-`"escalated"` by the generic attempts ceiling) is fixed, and a Promise-to-Pay
-is now its own state machine decoupled from the attempts ladder: it only
-escalates if it goes overdue or a post-PTP payment attempt fails, dates shown
-to the customer are real calendar strings (never `sim_day`), and a new
-reminder-cadence gate stops the same automated nudge from repeating same-day
-or forever.
+sequence diagram — a real bug (a same-turn `ptp_promised`/`resolved` outcome
+was being silently clobbered into `"escalated"` by the generic attempts
+ceiling) is fixed, and a Promise-to-Pay is now its own state machine decoupled
+from the attempts ladder: it only escalates if it goes overdue or a post-PTP
+payment attempt fails, dates shown to the customer are real calendar strings
+(never `sim_day`), and a new reminder-cadence gate stops the same automated
+nudge from repeating same-day or forever.
 <!-- previous update: Simulate tab Controls & Actions rework -->
 
 Previously (2026-09-05) — **Simulate tab Controls & Actions rework** (plan.md §9,
@@ -648,7 +678,7 @@ internal relative gating counter, never surfaced in customer-facing text.
 | Pipeline | `app/pipeline.py` ✅ | chains agents 3–6 into one run; returns the MetricsBlock | argparse CLI + printed summary |
 | API | `app/main.py`, `app/api/*` ✅ | REST over store + pipeline (`/api/events`, `/api/events/{id}/audit`, `/api/metrics`, `/api/pipeline/run`) | CORS to frontend only |
 | Dashboard | `frontend/src/pages/*` ✅ (fixtures; live via `VITE_DATA_SOURCE`) | at-risk queue, decision trail, charts, exception list, fraud-cluster alert | mirrors Razorpay's plain-English tone |
-| Simulate / Playground UI | `frontend/src/components/SimulateSession.tsx` ✅ (rewritten 2026-09-05, Controls & Actions reworked 2026-09-05, PTP/reminder bugfix S10 2026-09-05) | 4-column live-session layout: transcripts, unified audit/event trail, phone-style chat/call mockup (with an embedded fake-checkout sub-view for clicked payment links), and a trimmed Controls & Actions panel (AI Simulation Engine stack that stays live through a Promise-to-Pay wait, not just `ongoing`) | liquid-glass throughout; `sim_state` round-tripped exactly as returned; never writes to the store; `ticketStatus` (`'none'\|'ptp_pending'\|'human_review'\|'recovered'`) is local UI state, never a real `tickets` row; a PTP never auto-escalates from more turns alone |
+| Simulate / Playground UI | `frontend/src/components/SimulateSession.tsx` ✅ (rewritten 2026-09-05, Controls & Actions reworked 2026-09-05, PTP/reminder bugfix S10 2026-09-05, escalation-not-a-hard-stop + voice removed 2026-09-05) | 4-column live-session layout: transcripts, unified audit/event trail, a text-only WhatsApp phone mockup (with an embedded fake-checkout sub-view for clicked payment links), and a trimmed Controls & Actions panel that stays live through both a Promise-to-Pay wait and an escalation to human review, not just `ongoing` | liquid-glass throughout; `sim_state` round-tripped exactly as returned; never writes to the store; `ticketStatus` (`'none'\|'ptp_pending'\|'human_review'\|'recovered'`) is local UI state, never a real `tickets` row; a PTP never auto-escalates from more turns alone; only `resolved`/`halted` lock the conversation |
 | Unified Audit Log | `frontend/src/components/AuditTimeline.tsx` ✅ (revamped 2026-09-05) | single unified, systemized audit log engine across TicketDrawer, DetailDrawer, and SimulateSession: strict chronological sorting via monotonic sortKey; first-class Customer Actions (link clicks, OTP entries, customer replies, silence); 7 category color themes with interactive count-badged filter pills; specialized inline cards for Payment Links, Mandate Renewals, Payment Captures, and PTP commitments | unified presentation; strictly chronological; identical contract across DB-backed and rehearsal surfaces |
 | Payment checkout page | `frontend/src/pages/PayCheckout.tsx` ✅ (new 2026-09-05) | standalone `/pay/:token` page (no `AppShell` chrome) — OTP-entry simulation, bounded retry, terminal state past `MAX_ATTEMPTS` | the real customer-facing surface for the fake gateway; a real DB write via the backend's `/api/pay/{token}/attempt` |
 | Webhook listener | `app/webhooks/listener.py` ✅ | ingest Razorpay **test-mode** webhook deliveries as `detected` events | HMAC-SHA256 signature verified over the raw body; idempotent (dedup by event id); success/unknown events acknowledged but ignored; amounts paise→₹; no PII stored (emails/phones hashed) |
@@ -712,6 +742,11 @@ internal relative gating counter, never surfaced in customer-facing text.
 | Customer-facing dates are calendar strings, never `sim_day` (2026-09-05, S10) | `_format_calendar_date`/`_ordinal` produce e.g. "1st October"; `salary_reminder_date_label` reuses `recovery._next_salary_window`, `ptp_target_date_label` uses a plain `+5`-day wall-clock offset; `sim_day` itself stays an internal relative gating counter, never shown to a user | a rehearsal that tells a customer "I'll remind you on Day 8" reads as an obvious simulation artifact, not a believable date — the real product's `recovery.py` already formats no better (raw ISO timestamps, confirmed via research), so this Playground path is now stricter about presentation than the real pipeline, deliberately |
 | Reminder-cadence gate caps identical nudges, resets on a genuinely different ask (2026-09-05, S10) | `_classify_reminder_cta` tags each reminder's ask; `_reminder_gate` suppresses an identical tag repeating the same `sim_day`, escalates as `reminders_exhausted` past 3 distinct days, and resets the count the moment the tag changes | the UI already advertises "Max 3 automated reminders (24h cooldown)" but nothing enforced it — a live transcript showed the same "you cancelled the payment" line sent twice back-to-back, which is what a real customer would call spam, not diligence |
 | `ticketStatus` gains a `'ptp_pending'` state distinct from `'human_review'` (2026-09-05, S10) | `SimulateSession.tsx`'s `ticketStatus`: `'none' \| 'ptp_pending' \| 'human_review' \| 'recovered'`; `isActionable` (`outcome==='ongoing'\|\|'ptp_promised'`) gates the AI Simulation Engine buttons and chat input instead of `outcome==='ongoing'` alone | a Promise-to-Pay is a *wait*, not a stop — the previous single `'ptp_human_review'` state both mislabeled the case as "with a human" and (via `outcome!=='ongoing'` disabling every button) made it impossible for the tester to advance turns/days far enough to ever see the promise resolve or go overdue |
+| A clear agreement overrides the LLM's own outcome, not just the fallback's (2026-09-05, S11, bugfix) | `_apply_agreement_override(result, message, persona)` runs after every LLM call (success or fallback) in `send_message` and `advance_conversation`, before the S10 state machine — if the outcome is still `"ongoing"` and the message is an unambiguous agreement (`_is_clear_agreement`, same semantics as the fallback's own check, now shared), it force-corrects to `"ptp_promised"` regardless of what the model decided. Never applied to the `speaker="agent"` human-takeover path | this deployment runs with an LLM key configured, so the deterministic fallback's agreement detection (correct on its own) was silently discarded the moment an LLM call succeeded — a live transcript showed a customer's unambiguous "okay" (replying to the agent's own "should I send the payment link?") get no PTP at all, just more attempts until the generic ceiling escalated it. A model's own judgment is useful but not infallible on an unambiguous case; the deterministic check is cheap insurance that costs nothing when the model already agrees |
+| Fallback question-detection requires an on-topic signal, not a bare `"?"` (2026-09-05, S11, bugfix) | `_fallback_agent_reply`'s failure-explanation branch now needs a `_QUESTION_WORDS` hit or `"?"` paired with a `_FAILURE_DOMAIN_WORDS` hit; a new branch 3.5 (`_IDENTITY_WORDS`) answers bot/identity questions honestly instead | any `"?"` previously forced the same recycled root-cause-explanation text regardless of what was actually asked — an off-topic "Are you a bot?" got an answer about a dropped browser session, which doesn't address the question and (since that template has no variation) produces an obviously repeated line the moment it fires twice |
+| Reminders-cap UI reads real state, not a `sim_day` guess (2026-09-05, S11, bugfix) | `SimulateSession.tsx`'s `renderRemindersMetric` now derives `remindersScheduled` from `simState.reminder_days.length` (the real S10 cadence-gate data) instead of `Math.min(3, sim_day)` | the old heuristic could show "3/3 (0 left)" on a case that hadn't actually exhausted anything, or vice versa — once the backend started tracking the real cadence (S10) there was no reason for the badge to keep guessing |
+| Escalation is a hand-off, not a hard stop (2026-09-05) | `SimulateSession.tsx`'s `isActionable` is `outcome!=='resolved' && outcome!=='halted'` (was `outcome==='ongoing'\|\|'ptp_promised'`) — `"escalated"` (any reason) stays fully interactive: chat input, Next Turn, Auto-Run, and every panel button. Required no backend change — the S10 state machine already lets a same-turn `ptp_promised`/`resolved` win over the escalation ceiling, and `phase==='ended'` already rendered the full 4-column UI | a real human-review ticket being open doesn't mean the AI should go mute — a customer can still ask an in-scope question or change their mind and agree to pay after escalation, and the agent should keep helping (including sending a payment link) exactly as a real support hand-off would, right up until an actual payment closes the case. `"halted"` (suspected fraud) is the deliberate exception — the project's stopping rules already say Recovery refuses to act on a fraud-flagged case, and that policy must hold here too |
+| Voice input removed from Simulate (2026-09-05) | Deleted the `SpeechRecognition` apparatus from `SimulateSession.tsx` (interfaces, `getSpeechRecognition`, `startListening`/`stopListening`, `isListening`/`speechSupported` state, `recognitionRef`) along with the mic button in the WhatsApp chat input bar | voice playback was already gated to `channel==='call'`, which is permanently unreachable via Simulate since `begin()` forces `channel: 'message'` (an earlier fix, so the embedded checkout/reworked panel always have somewhere to render) — the mic button was voice input's only remaining UI entry point, so the whole feature was dead code once that button was removed |
 
 ---
 

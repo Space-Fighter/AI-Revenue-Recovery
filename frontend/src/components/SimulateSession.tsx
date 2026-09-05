@@ -184,49 +184,6 @@ const LINK_PATTERN = /(https?:\/\/(?:rzp\.io|razorpay\.me)\/\S+)/g
 
 type TurnWithAudio = PlaygroundTurn & { audio_base64?: string }
 
-interface SpeechRecognitionResultItem {
-  transcript: string
-}
-
-interface SpeechRecognitionResult {
-  [index: number]: SpeechRecognitionResultItem
-  length: number
-}
-
-interface SpeechRecognitionResults {
-  [index: number]: SpeechRecognitionResult
-  length: number
-}
-
-interface SpeechRecognitionEvent {
-  resultIndex: number
-  results: SpeechRecognitionResults
-}
-
-interface SpeechRecognitionInstance {
-  continuous: boolean
-  interimResults: boolean
-  lang: string
-  onstart: () => void
-  onresult: (event: SpeechRecognitionEvent) => void
-  onerror: (event: { error: string }) => void
-  onend: () => void
-  start: () => void
-  stop: () => void
-  abort: () => void
-}
-
-type SpeechRecognitionConstructor = new () => SpeechRecognitionInstance
-
-const getSpeechRecognition = (): SpeechRecognitionConstructor | null => {
-  if (typeof window === 'undefined') return null
-  const win = window as unknown as {
-    SpeechRecognition?: SpeechRecognitionConstructor
-    webkitSpeechRecognition?: SpeechRecognitionConstructor
-  }
-  return win.SpeechRecognition || win.webkitSpeechRecognition || null
-}
-
 export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) => {
   const [phase, setPhase] = useState<Phase>('connecting')
   const [mode, setMode] = useState<PlaygroundMode>('ai')
@@ -243,8 +200,6 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
   const [error, setError] = useState<string | null>(null)
   const [speakingIndex, setSpeakingIndex] = useState<number | null>(null)
   const [callDuration, setCallDuration] = useState(0)
-  const [isListening, setIsListening] = useState(false)
-  const [speechSupported, setSpeechSupported] = useState(false)
   const [baseTrail, setBaseTrail] = useState<AuditRead[]>([])
   const [simulatedEvents, setSimulatedEvents] = useState<UnifiedAuditNode[]>([])
   const [ticketStatus, setTicketStatus] = useState<'none' | 'ptp_pending' | 'human_review' | 'recovered'>('none')
@@ -255,7 +210,6 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
   const transcriptEndRef = useRef<HTMLDivElement | null>(null)
   const cancelSpeechRef = useRef<(() => void) | null>(null)
   const autoPlayAbortRef = useRef(false)
-  const recognitionRef = useRef<SpeechRecognitionInstance | null>(null)
   const actionSeqRef = useRef(0)
   const finalSilenceLoggedRef = useRef(false)
 
@@ -339,10 +293,6 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
 
   useLiquidGlass(drawerRef, { scale: -112, chroma: 6, border: 0.05, blur: 4 }, isOpen)
 
-  useEffect(() => {
-    setSpeechSupported(!!getSpeechRecognition())
-  }, [])
-
   // Call timer
   useEffect(() => {
     if (phase !== 'live' || channel !== 'call') {
@@ -377,79 +327,6 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
     }
   }
 
-  const startListening = () => {
-    interruptSpeech()
-
-    const SpeechRec = getSpeechRecognition()
-    if (!SpeechRec) {
-      setError('Speech recognition is not available in this browser. Please type your reply.')
-      return
-    }
-
-    try {
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.abort()
-        } catch {
-          // ignore
-        }
-      }
-
-      const rec = new SpeechRec()
-      rec.continuous = false
-      rec.interimResults = true
-      rec.lang = 'hi-IN'
-
-      rec.onstart = () => {
-        setIsListening(true)
-        setError(null)
-      }
-
-      rec.onresult = (e: SpeechRecognitionEvent) => {
-        let transcript = ''
-        for (let i = e.resultIndex; i < e.results.length; i++) {
-          const item = e.results[i]?.[0]
-          if (item?.transcript) {
-            transcript += item.transcript
-          }
-        }
-        if (transcript) {
-          setInput(transcript)
-        }
-      }
-
-      rec.onerror = (e: { error: string }) => {
-        setIsListening(false)
-        if (e.error === 'not-allowed') {
-          setError('Microphone access was denied. Please allow microphone permissions or type your message.')
-        } else if (e.error !== 'no-speech') {
-          console.warn('Speech recognition warning:', e.error)
-        }
-      }
-
-      rec.onend = () => {
-        setIsListening(false)
-      }
-
-      recognitionRef.current = rec
-      rec.start()
-    } catch (err) {
-      console.warn('Speech recognition start failed:', err)
-      setIsListening(false)
-    }
-  }
-
-  const stopListening = () => {
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop()
-      } catch {
-        // ignore
-      }
-    }
-    setIsListening(false)
-  }
-
   const reset = () => {
     setPhase('connecting')
     setMode('ai')
@@ -462,7 +339,6 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
     setInput('')
     setError(null)
     setCallDuration(0)
-    setIsListening(false)
     setSimulatedEvents([])
     setTicketStatus('none')
     setPhoneView('chat')
@@ -470,14 +346,6 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
     finalSilenceLoggedRef.current = false
     autoPlayAbortRef.current = true
     turnTimestampsRef.current.clear()
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.abort()
-      } catch {
-        // ignore
-      }
-      recognitionRef.current = null
-    }
     if (cancelSpeechRef.current) {
       cancelSpeechRef.current()
     }
@@ -770,7 +638,6 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
     if (!message || busy) return
     finalSilenceLoggedRef.current = false
     interruptSpeech()
-    if (isListening) stopListening()
     setBusy(true)
     setError(null)
     const currentDay = simState?.sim_day ?? 1
@@ -1016,9 +883,12 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
   const isAiMode = mode === 'ai' || mode === 'auto'
   // A Promise-to-Pay is a wait, not an end state — the tester must still be
   // able to advance turns/days to see it either get paid or go overdue.
-  // Only a genuinely terminal outcome (resolved/escalated/halted) locks the
-  // conversation.
-  const isActionable = outcome === 'ongoing' || outcome === 'ptp_promised'
+  // An escalation to human review is likewise not a hard stop: the agent
+  // keeps answering in-scope queries (and can still help with a payment link
+  // if the customer changes their mind) while the ticket stays open — only a
+  // genuine payment (resolved) or a fraud/security halt (halted) ends the
+  // conversation for good.
+  const isActionable = outcome !== 'resolved' && outcome !== 'halted'
 
   return (
     <div className="fixed inset-0 z-50 flex items-stretch justify-center bg-black/80 backdrop-blur-md animate-fade-in p-0 md:p-2 lg:p-3">
@@ -1559,19 +1429,6 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
                           disabled={busy || !isActionable}
                           className="flex-1 px-3.5 py-2 rounded-full bg-[#2a3942] text-white text-xs placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-emerald-500"
                         />
-                        {speechSupported && (
-                          <button
-                            type="button"
-                            onClick={isListening ? stopListening : startListening}
-                            disabled={busy || !isActionable}
-                            className={`p-2 rounded-full text-xs font-bold transition-colors cursor-pointer shrink-0 ${
-                              isListening ? 'bg-red-500 text-white animate-pulse' : 'bg-[#2a3942] text-slate-300 hover:text-white'
-                            }`}
-                            title={isListening ? 'Stop recording' : 'Voice input'}
-                          >
-                            🎤
-                          </button>
-                        )}
                         <button
                           type="submit"
                           disabled={busy || !input.trim() || !isActionable}
