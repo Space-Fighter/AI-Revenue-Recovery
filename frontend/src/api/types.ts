@@ -56,6 +56,10 @@ export interface EventRead {
   promised_date?: string | null
   ptp_status?: PTPStatus
   retry_schedule?: Array<Record<string, unknown>> | null
+  /** `plink_...` = a real Razorpay test-mode Payment Link; `fake_...` = the
+   * fake gateway (no Razorpay test-mode keys configured for this run). */
+  payment_link_id?: string | null
+  payment_link_status?: string
 }
 
 export interface AuditRead {
@@ -266,6 +270,34 @@ export interface MetricsBlock {
   tickets?: TicketMetrics
 }
 
+// --- Public payment-link checkout (backend: app/api/payment_routes.py) -----
+// A real customer lands here from an SMS/WhatsApp link. No dashboard chrome.
+
+export interface PaymentPageResponse {
+  token: string
+  event_id: string
+  customer_name: string
+  amount: string
+  currency: string
+  payment_link_status: string
+  attempts_made: number
+  attempts_remaining: number
+}
+
+export type PaymentAttemptFailureReason = 'wrong_otp' | 'insufficient_funds' | 'user_cancelled'
+
+export interface PaymentAttemptResponse {
+  captured: boolean
+  reason: PaymentAttemptFailureReason | 'captured' | 'already_captured'
+  attempts_remaining: number
+}
+
+export interface PaymentAttemptExhaustedResponse {
+  status: 'error'
+  reason: 'max_attempts_exceeded'
+  attempts_remaining: 0
+}
+
 export interface PipelineRunResponse {
   ran_at: string
   metrics: MetricsBlock
@@ -277,7 +309,10 @@ export interface PipelineRunResponse {
 // Writes nothing to the real events/tickets tables and never touches
 // MetricsBlock — every screen here is labeled as a rehearsal.
 
-export type PlaygroundMode = 'interactive' | 'auto'
+// 'custom'/'ai' are the current names; 'interactive'/'auto' are legacy
+// aliases still accepted by the backend (AGENTS_CONTRACT.md §12/§13 S5) —
+// prefer sending 'custom'/'ai' going forward.
+export type PlaygroundMode = 'custom' | 'ai' | 'interactive' | 'auto'
 export type PlaygroundChannel = 'call' | 'message'
 export type PlaygroundOutcome = 'ongoing' | 'ptp_promised' | 'resolved' | 'escalated' | 'halted'
 export type PlaygroundSpeaker = 'agent' | 'customer'
@@ -285,6 +320,37 @@ export type PlaygroundSpeaker = 'agent' | 'customer'
 export interface PlaygroundTurn {
   speaker: PlaygroundSpeaker
   text: string
+}
+
+// Round-tripped verbatim: resend the exact object received in the next
+// request's body (AGENTS_CONTRACT.md §12, frozen shape).
+export interface PlaygroundSimState {
+  mode: 'custom' | 'ai'
+  controlled_by: { agent: 'ai' | 'human'; customer: 'ai' | 'human' }
+  sim_day: number
+  sim_hour: number
+  exchanges_today: number
+  attempts_so_far: number
+  escalation_stage: number
+  customer_last_responded_day: number
+  customer_response_probability: number
+  outstanding_asks: string[]
+  last_reply_text: string | null
+  capture_attempts: number
+}
+
+export type PlaygroundEscalationReason =
+  | 'customer_requested_human'
+  | 'out_of_scope'
+  | 'max_attempts_exceeded'
+
+export interface PlaygroundEscalation {
+  reason: PlaygroundEscalationReason
+  outstanding_asks: string[]
+  last_customer_message: string
+  root_cause: RootCause | null
+  attempts_so_far: number
+  conversation_summary: string
 }
 
 export interface PlaygroundPersona {
@@ -308,6 +374,7 @@ export interface PlaygroundStartResponse {
   opening_turn: PlaygroundTurn
   outcome: PlaygroundOutcome
   history: PlaygroundTurn[]
+  sim_state?: PlaygroundSimState
 }
 
 export interface PlaygroundMessageResponse {
@@ -315,14 +382,21 @@ export interface PlaygroundMessageResponse {
   outcome: PlaygroundOutcome
   reasoning: string
   history: PlaygroundTurn[]
+  sim_state?: PlaygroundSimState
+  escalation?: PlaygroundEscalation
 }
 
 export interface PlaygroundAdvanceResponse {
-  customer_turn: PlaygroundTurn
-  agent_turn: PlaygroundTurn
+  /** `no_response: true` -> a simulated "customer didn't reply this turn";
+   * render as a greyed placeholder row, not a chat bubble. */
+  no_response?: boolean
+  customer_turn: PlaygroundTurn | null
+  agent_turn: PlaygroundTurn | null
   outcome: PlaygroundOutcome
   reasoning: string
   history: PlaygroundTurn[]
+  sim_state?: PlaygroundSimState
+  escalation?: PlaygroundEscalation
 }
 
 export interface PlaygroundPayResponse {
@@ -330,6 +404,9 @@ export interface PlaygroundPayResponse {
   outcome: PlaygroundOutcome
   reasoning: string
   history: PlaygroundTurn[]
-  payment_id: string
+  payment_id: string | null
   amount: string
+  sim_state?: PlaygroundSimState
+  captured?: boolean
+  reason?: string
 }

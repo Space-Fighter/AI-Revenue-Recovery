@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { dataSource } from '../api/dataSource'
 import { useAsync } from '../hooks/useAsync'
+import { useLiquidGlass } from '../lib/liquidGlass'
 import { RaiseQuestionModal } from './TicketActionModals'
 import { getEmployeeEmail } from '../lib/session'
 import type { VoiceScript, VoiceAudioClip } from '../api/types'
@@ -25,9 +26,12 @@ export const VoiceCallDrawer: React.FC<Props> = ({ eventId, isOpen, onClose }) =
   const [questionOpen, setQuestionOpen] = useState(false)
   const [raisedTicket, setRaisedTicket] = useState<string | null>(null)
 
+  const drawerRef = useRef<HTMLDivElement>(null)
   const audioElRef = useRef<HTMLAudioElement | null>(null)
   const clipsRef = useRef<VoiceAudioClip[] | null>(null)
   const stoppedRef = useRef(false)
+
+  useLiquidGlass(drawerRef, { scale: -112, chroma: 6, border: 0.05, blur: 4 }, isOpen)
 
   const stopPlayback = () => {
     stoppedRef.current = true
@@ -149,13 +153,10 @@ export const VoiceCallDrawer: React.FC<Props> = ({ eventId, isOpen, onClose }) =
 
   return (
     <div className="fixed inset-0 z-50 flex justify-end bg-black/60 backdrop-blur-sm animate-fade-in">
-      <div className="w-full max-w-xl bg-slate-900 border-l border-slate-800 p-6 flex flex-col h-full shadow-2xl overflow-y-auto">
+      <div ref={drawerRef} className="w-full max-w-xl liquid-glass-drawer p-6 flex flex-col h-full shadow-2xl overflow-y-auto text-slate-100">
         {/* Header */}
-        <div className="flex items-center justify-between pb-4 border-b border-slate-800">
+        <div className="flex items-center justify-between pb-4 border-b border-white/[0.08]">
           <div className="flex items-center gap-2">
-            <span className="p-2 rounded-lg bg-blue-500/10 text-blue-400">
-              🎙️
-            </span>
             <div>
               <h2 className="text-lg font-semibold text-white">
                 Hinglish Voice Recovery Agent
@@ -167,20 +168,20 @@ export const VoiceCallDrawer: React.FC<Props> = ({ eventId, isOpen, onClose }) =
           </div>
           <button
             onClick={handleClose}
-            className="text-slate-400 hover:text-white p-1 rounded-md hover:bg-slate-800"
+            className="text-slate-400 hover:text-white p-1.5 rounded-md hover:bg-white/10 transition-colors"
           >
-            ✕
+            Close
           </button>
         </div>
 
         {loading ? (
           <div className="flex-1 flex items-center justify-center">
-            <div className="animate-spin rounded-full h-8 w-8 border-t-2 border-b-2 border-blue-500"></div>
+            <div className="animate-spin rounded-full h-8 w-8 border-2 border-white/10 border-t-blue-400"></div>
           </div>
         ) : scriptData ? (
           <div className="flex-1 py-4 flex flex-col gap-6">
             {/* Action Bar */}
-            <div className="flex items-center justify-between p-4 rounded-xl bg-slate-800/60 border border-slate-700/50">
+            <div className="flex items-center justify-between p-4 rounded-xl liquid-glass-card">
               <div>
                 <p className="text-xs font-medium text-slate-300">
                   Est. Call Duration: {scriptData.estimated_duration_sec}s
@@ -191,20 +192,18 @@ export const VoiceCallDrawer: React.FC<Props> = ({ eventId, isOpen, onClose }) =
                 {voiceMode && (
                   <p className="text-[10px] mt-1 text-slate-500">
                     {voiceMode === 'sarvam'
-                      ? '🔊 Sarvam AI (bulbul) neural voice'
-                      : '🔉 Browser fallback voice — set SARVAM_API_KEY for neural TTS'}
+                      ? 'Sarvam AI (bulbul) neural voice'
+                      : 'Browser fallback voice — set SARVAM_API_KEY for neural TTS'}
                   </p>
                 )}
               </div>
               <button
                 onClick={handlePlayAudio}
-                className={`px-4 py-2 rounded-lg font-medium text-xs flex items-center gap-2 transition-all ${
-                  isPlaying
-                    ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40 animate-pulse'
-                    : 'bg-blue-600 hover:bg-blue-500 text-white shadow-lg shadow-blue-500/20'
+                className={`px-4 py-2 rounded-lg font-medium text-xs flex items-center gap-2 transition-colors liquid-glass-pill hover:bg-white/10 ${
+                  isPlaying ? 'text-amber-300' : 'text-white'
                 }`}
               >
-                {isPlaying ? '⏹ Stop Audio Call' : '▶ Play Simulated Call'}
+                {isPlaying ? 'Stop Audio Call' : 'Play Simulated Call'}
               </button>
             </div>
 
@@ -220,18 +219,16 @@ export const VoiceCallDrawer: React.FC<Props> = ({ eventId, isOpen, onClose }) =
                   return (
                     <div
                       key={i}
-                      className={`p-3.5 rounded-xl text-sm transition-all ${
-                        isAgent
-                          ? 'bg-blue-950/40 border border-blue-800/40 text-blue-100 ml-4'
-                          : 'bg-slate-800/80 border border-slate-700/60 text-slate-200 mr-4'
-                      } ${isActive ? 'ring-2 ring-blue-400 scale-[1.01]' : ''}`}
+                      className={`p-3.5 rounded-xl text-sm liquid-glass-card ${isAgent ? 'ml-4' : 'mr-4'} ${
+                        isActive ? 'ring-1 ring-blue-400/60' : ''
+                      }`}
                     >
                       <div className="flex items-center justify-between text-[11px] font-semibold mb-1">
-                        <span className={isAgent ? 'text-blue-400' : 'text-slate-400'}>
+                        <span className={isAgent ? 'text-blue-300' : 'text-slate-400'}>
                           {turn.speaker}
                         </span>
                         {turn.emotion && (
-                          <span className="text-[10px] px-1.5 py-0.5 rounded bg-slate-900/60 text-slate-400 capitalize">
+                          <span className="text-[10px] px-1.5 py-0.5 rounded liquid-glass-pill text-slate-400 capitalize">
                             {turn.emotion}
                           </span>
                         )}
@@ -244,16 +241,16 @@ export const VoiceCallDrawer: React.FC<Props> = ({ eventId, isOpen, onClose }) =
             </div>
 
             {/* WhatsApp Follow-up preview */}
-            <div className="p-4 rounded-xl bg-emerald-950/30 border border-emerald-800/40">
+            <div className="p-4 rounded-xl liquid-glass-card">
               <div className="flex items-center justify-between mb-2">
-                <span className="text-xs font-semibold text-emerald-400 flex items-center gap-1.5">
-                  💬 Automated WhatsApp Nudge
+                <span className="text-xs font-semibold text-emerald-300">
+                  Automated WhatsApp Nudge
                 </span>
                 <button
                   onClick={handleCopyWhatsApp}
-                  className="text-[11px] px-2 py-1 rounded bg-emerald-900/50 hover:bg-emerald-800 text-emerald-200"
+                  className="text-[11px] px-2 py-1 rounded liquid-glass-pill hover:bg-white/10 text-emerald-200 transition-colors"
                 >
-                  {copied ? '✓ Copied' : 'Copy Text'}
+                  {copied ? 'Copied' : 'Copy Text'}
                 </button>
               </div>
               <p className="text-xs text-emerald-100/90 leading-relaxed font-mono">
@@ -263,7 +260,7 @@ export const VoiceCallDrawer: React.FC<Props> = ({ eventId, isOpen, onClose }) =
 
             {/* The AI stops where it should: a question it cannot answer goes
                 to a person rather than getting improvised on the call. */}
-            <div className="p-4 rounded-xl bg-slate-800/60 border border-slate-700/50">
+            <div className="p-4 rounded-xl liquid-glass-card">
               {raisedTicket ? (
                 <p className="text-xs text-slate-300">
                   Handed to a human as{' '}
@@ -279,7 +276,7 @@ export const VoiceCallDrawer: React.FC<Props> = ({ eventId, isOpen, onClose }) =
                   <button
                     type="button"
                     onClick={() => setQuestionOpen(true)}
-                    className="text-xs px-3 py-1.5 rounded-lg bg-slate-900/60 hover:bg-slate-900 text-slate-200 border border-slate-700"
+                    className="text-xs px-3 py-1.5 rounded-lg liquid-glass-pill hover:bg-white/10 text-slate-200 transition-colors"
                   >
                     Customer asked something we can&apos;t answer
                   </button>

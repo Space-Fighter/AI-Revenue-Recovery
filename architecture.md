@@ -8,7 +8,11 @@ Diagrams and design rationale. Companion to
 > the same change that alters the architecture, data model, agent flow, or
 > runtime topology.
 
-Last updated: 2026-09-04 — **Simulate / Playground + Sarvam TTS fix + synthetic
+Last updated: 2026-09-05 — **Systemized Unified Audit Log & Customer Action Trail** (plan.md §15):
+Unified the AI pipeline decision trail and simulation event logs into one standardized, systemized, color-coded audit log component (`frontend/src/components/AuditTimeline.tsx`). Customer actions (link clicks, OTP entries, customer replies, calls answered, silence) elevated to first-class audit events; strict chronological sorting merges store records and live simulation events via a monotonic `sortKey`; 7 semantic color-coded categories with interactive filter pills; specialized inline cards for Payment Links, Mandate Renewals, and verified Payment Captures. Deployed across `TicketDrawer.tsx`, `DetailDrawer.tsx`, and `SimulateSession.tsx` Column 2.
+<!-- previous update: Payment-capture integrity fix + Playground redesign -->
+
+Prior: 2026-09-04 — **Simulate / Playground + Sarvam TTS fix + synthetic
 contact data**: `app/agents/playground.py` (stateless sandboxed rehearsal agent,
 two LLM personas), 3 new API routes (`POST /events/{id}/playground/start|message|advance`),
 frontend `SimulateSession.tsx` + `Playground.tsx`, `chat_turns()` in `llm.py`;
@@ -83,8 +87,12 @@ flowchart TD
         REC[Recovery Agent<br/>route intervention · enforce stopping rules]
         TRI[Triage Agent<br/>open priority-ranked human-review tickets]
         AUD[Audit / Reporting Agent<br/>metrics · exception list · queue]
-        DET --> DIA --> REC --> TRI --> AUD
+        DET --> DIA --> REC --> PAY
+        PAY --> TRI --> AUD
     end
+
+    PAY[["Payment-capture engine<br/>app/agents/payment.py<br/>REAL Razorpay link (async webhook)<br/>OR fake gateway (sync-resolved)"]]
+    PAY -->|"apply_capture:<br/>THE ONLY place status=RECOVERED"| STORE
 
     DET <--> STORE
     DIA <--> STORE
@@ -97,6 +105,9 @@ flowchart TD
     AUD --> API
     STORE --> API
     API[FastAPI<br/>app/main.py + app/api/*] --> UI[React dashboard<br/>frontend/]
+
+    WH -.->|"payment.captured /<br/>payment_link.paid"| PAY
+    UI -->|"/pay/:token attempt<br/>(fake-gateway checkout page)"| PAY
 
     UI -->|"take · resolve · raise a question"| HUM
     HUM(["Human reviewer<br/>agent=human in the audit trail"])
@@ -112,7 +123,7 @@ flowchart TD
 
     classDef done fill:#d3f9d8,stroke:#2b8a3e;
     classDef todo fill:#fff3bf,stroke:#e67700;
-    class SYN,STORE,DET,DIA,REC,TRI,AUD,API,UI,RAG,LLM,WH,HUM done;
+    class SYN,STORE,DET,DIA,REC,TRI,AUD,API,UI,RAG,LLM,WH,HUM,PAY done;
 ```
 
 Both event sources feed the same store: the synthetic generator seeds a batch;
@@ -136,9 +147,23 @@ is a real edge, not a diagram flourish: taking a ticket, closing it with a note,
 and recording money they recovered each write an `agent="human"` audit row, and
 human-recovered money is tracked separately from what the agents collected.
 
-Green = built. `app/pipeline.py` chains DET→DIA→REC→TRI→AUD; `app/api/*`
-exposes the store + pipeline + review queue over REST; the React dashboard
-renders it.
+**Recovery no longer terminates directly in `recovered`/`exception` — it fans
+into the payment-capture engine** (`app/agents/payment.py`, 2026-09-05).
+`recovery.py._resolve_outcome` sends a payment link and stamps it onto the
+event; a **real** Razorpay link genuinely waits for the webhook listener to
+call `payment.apply_capture` asynchronously (the event stays `action_taken`
+until then — honest, not a bug, if a demo run never gets a webhook); a
+**fake** link (no keys configured — the default demo path) has no live human
+to click it in a batch run, so `_resolve_outcome` resolves it synchronously,
+inline. The Playground's `/pay/:token` page is the same engine's UI-fronted
+surface for a human actually clicking a fake link. `apply_capture` is the
+single place `Event.status` becomes `RECOVERED` from a capture, replacing the
+previous `recovery.py`-internal `_stable_hash` coin flip that set `RECOVERED`
+with no capture evidence behind it at all.
+
+Green = built. `app/pipeline.py` chains DET→DIA→REC→PAY→TRI→AUD; `app/api/*`
+exposes the store + pipeline + review queue + `/pay/:token` over REST; the
+React dashboard renders it.
 
 ---
 
@@ -212,6 +237,12 @@ erDiagram
         float       diagnosis_confidence "nullable 0..1"
         numeric     recovered_amount "14,2 — default 0; the honest total"
         numeric     human_recovered_amount "14,2 — of the total, how much a human brought in"
+        text        payment_link_id "nullable — plink_... (Razorpay) or fake_... (fake gateway)"
+        text        payment_link_url "nullable — shown to customer / used by /pay/:token"
+        text        payment_link_status "none → created → awaiting_capture → captured | failed | expired"
+        timestamptz payment_link_sent_at "nullable"
+        text        payment_capture_source "nullable — razorpay_webhook | fake_gateway"
+        numeric     customer_fake_balance "14,2 nullable — synthetic balance for the fake gateway's insufficient-funds check"
     }
 
     AUDIT_LOG {
@@ -270,8 +301,9 @@ stateDiagram-v2
     detected --> exception : obvious non-recoverable
     diagnosed --> flagged : Triage — fraud-like cluster (HALT)
     diagnosed --> action_taken : Recovery Agent runs an intervention
-    action_taken --> recovered : money clawed back
-    action_taken --> exception : stopping rule hit / gave up (with reason)
+    action_taken --> action_taken : payment_link_sent (awaiting_capture) — a real Razorpay link waits for an async webhook
+    action_taken --> recovered : payment.apply_capture() confirms a capture (fake gateway resolves sync; a real webhook resolves async)
+    action_taken --> exception : capture failed / stopping rule hit / gave up (with reason)
     action_taken --> action_taken : retry within limits (attempts_so_far++)
     exception --> recovered : human resolves a ticket, money in (agent=human)
     flagged --> recovered : human confirms genuine + collects (agent=human)
@@ -285,6 +317,35 @@ stateDiagram-v2
 stopped (suspected abuse), never retried by an agent. The only way out of a
 terminal state is a **person** closing a review ticket having actually collected
 the outstanding money — an audited, attributed override, never an automated one.
+
+**`action_taken --> recovered` is gated on a real payment capture** (§5.2) —
+never a coin flip or a conversation outcome. See "Key design decisions" (§8)
+for why this replaced the earlier `_stable_hash`-only outcome.
+
+### 5.2 Payment-link lifecycle (`app/agents/payment.py`)
+
+```mermaid
+stateDiagram-v2
+    [*] --> none
+    none --> created : create_payment_link() — Razorpay test-mode link, or a fake_... token when no keys are configured
+    created --> awaiting_capture : link handed to the customer (payment_link_sent_at stamped)
+    awaiting_capture --> captured : apply_capture(captured=True) — Event.status becomes RECOVERED here, and ONLY here
+    awaiting_capture --> failed : apply_capture(captured=False) — wrong_otp | insufficient_funds | user_cancelled; Event.status left to the caller
+    awaiting_capture --> expired : link/webhook never arrives
+    captured --> [*]
+    failed --> [*]
+    expired --> [*]
+```
+
+Orthogonal to `PTPStatus` — an event can be `ptp_status=promised` (a future
+promised date) and `payment_link_status=awaiting_capture` (a link already
+sent) at the same time; a same-session webhook wait must never corrupt PTP's
+real grace-period semantics. The **fake-gateway path resolves synchronously**
+(no live human to click a link in a batch run, explicitly modeled as "the
+gateway resolves for the synthetic customer"); the **real Razorpay path stays
+`awaiting_capture`** until an async `payment.captured`/`payment_link.paid`
+webhook confirms it — honestly non-terminal if that webhook never arrives in
+an offline demo run.
 
 ### 5.1 Human-review ticket lifecycle
 
@@ -433,6 +494,19 @@ write functions. The `history` list lives in the browser and is resent with ever
 request — the backend is completely stateless for Simulate sessions. A judge
 playing *"yes I'll pay"* cannot move real recovery metrics.
 
+**2026-09-05 redesign** (diagram above still holds structurally; details
+updated): "interactive"/"auto" renamed `"custom"`/`"ai"` (legacy names still
+accepted); a sibling `sim_state` dict (game clock, escalation stage,
+`outstanding_asks`, response probability) is now resent alongside `history` on
+every call, still entirely client-held — the backend remains stateless. Either
+role can now be taken over by a human via `sim_state.controlled_by`. A
+`POST /playground/pay` step calls `click_payment_link`, which calls the same
+**pure** `payment.resolve_fake_capture` the real pipeline uses (weighted
+wrong_otp/insufficient_funds/user_cancelled/success) but **never**
+`payment.apply_capture` — the one hard boundary that keeps this diagram's
+"never writes to the store" guarantee true even though the module now shares
+code with the money-moving payment engine.
+
 ---
 
 ## 7. Component responsibilities
@@ -456,6 +530,9 @@ playing *"yes I'll pay"* cannot move real recovery metrics.
 | Pipeline | `app/pipeline.py` ✅ | chains agents 3–6 into one run; returns the MetricsBlock | argparse CLI + printed summary |
 | API | `app/main.py`, `app/api/*` ✅ | REST over store + pipeline (`/api/events`, `/api/events/{id}/audit`, `/api/metrics`, `/api/pipeline/run`) | CORS to frontend only |
 | Dashboard | `frontend/src/pages/*` ✅ (fixtures; live via `VITE_DATA_SOURCE`) | at-risk queue, decision trail, charts, exception list, fraud-cluster alert | mirrors Razorpay's plain-English tone |
+| Simulate / Playground UI | `frontend/src/components/SimulateSession.tsx` ✅ (rewritten 2026-09-05) | two-column live-session layout: phone-style chat/call mockup + a structured, timestamped Messaging/Call/Customer-Actions transcript-log panel; "Take over this simulation" + "View Transcripts" pairing; embeds `AuditTimeline` in Column 2 for a live unified decision & customer action stream | liquid-glass throughout; `sim_state` round-tripped exactly as returned; never writes to the store |
+| Unified Audit Log | `frontend/src/components/AuditTimeline.tsx` ✅ (revamped 2026-09-05) | single unified, systemized audit log engine across TicketDrawer, DetailDrawer, and SimulateSession: strict chronological sorting via monotonic sortKey; first-class Customer Actions (link clicks, OTP entries, customer replies, silence); 7 category color themes with interactive count-badged filter pills; specialized inline cards for Payment Links, Mandate Renewals, Payment Captures, and PTP commitments | unified presentation; strictly chronological; identical contract across DB-backed and rehearsal surfaces |
+| Payment checkout page | `frontend/src/pages/PayCheckout.tsx` ✅ (new 2026-09-05) | standalone `/pay/:token` page (no `AppShell` chrome) — OTP-entry simulation, bounded retry, terminal state past `MAX_ATTEMPTS` | the real customer-facing surface for the fake gateway; a real DB write via the backend's `/api/pay/{token}/attempt` |
 | Webhook listener | `app/webhooks/listener.py` ✅ | ingest Razorpay **test-mode** webhook deliveries as `detected` events | HMAC-SHA256 signature verified over the raw body; idempotent (dedup by event id); success/unknown events acknowledged but ignored; amounts paise→₹; no PII stored (emails/phones hashed) |
 
 ---
@@ -464,6 +541,7 @@ playing *"yes I'll pay"* cannot move real recovery metrics.
 
 | Decision | Choice | Why |
 |---|---|---|
+| Unified Audit Log & Customer Action Trail | single `AuditTimeline.tsx` engine shared by TicketDrawer, DetailDrawer, and SimulateSession Col 2; Customer Actions elevated to first-class audit events; strictly sorted by monotonic `sortKey` | operational transparency: human reviewers and operators must see what the customer actually did (clicked link, submitted OTP, promised to pay, remained silent) interspersed in exact chronological order with agent decisions; specialized cards display payment link URLs, mandate renewals, and verified capture receipts inline |
 | Datastore | PostgreSQL 17 via the `pgvector/pgvector:pg17` **Docker container** (`docker compose up -d`) | real types (`NUMERIC`, `TIMESTAMPTZ`, `JSONB`, `vector`); FK always on; pgvector native for the RAG layer. Docker Desktop + WSL2 work here — an earlier note claiming otherwise was wrong. `scripts/pg.ps1` (embedded binary, no extensions) kept as a no-Docker fallback with RAG disabled |
 | ORM / validation | SQLModel (SQLAlchemy 2 + Pydantic) | one model stack for tables *and* API request/response shapes |
 | Validation split | thin table models + `*Create` / `*Update` / `*Read` schema models | `table=True` disables Pydantic validation; schema models restore it (`extra="forbid"`, bounds, `field_validator`s) and double as API contracts |
@@ -483,6 +561,13 @@ playing *"yes I'll pay"* cannot move real recovery metrics.
 | RAG knowledge base | curated + bounded — dedup near-identical inserts, cap each `(root_cause, event_type)` bucket | the same "bounded, with stopping rules" discipline as the recovery agent; keeps the KB *useful* (hard cases, not millions of routine dupes) and cheap |
 | RAG embeddings | `app/llm.embed` — OpenAI `text-embedding-3-small` (`dimensions=384`) or local `fastembed` `all-MiniLM-L6-v2` (384-d) | one fixed dimension either way; OpenRouter has no embeddings endpoint so an OpenRouter-only setup uses the local model; RAG is a no-op with neither |
 | Not used | LangGraph; FAISS/Milvus/Vespa; `langchain-postgres` PGVector | pipeline is already a clean linear state machine; a dedicated vector store is premature at demo scale; LangChain's PGVector would add opaque library-managed tables and break "`store.py` is the only Postgres interface". LangChain is used only for the `Embeddings` interface wrapper |
+| **Payment capture is one engine, one gate** | `Event.status` becomes `RECOVERED` ONLY via `payment.apply_capture` (§5.2) — never the old `recovery._resolve_outcome` coin flip (`_stable_hash(event_id) % 100 < p`) directly setting status | a judge inspecting the audit trail must never see "recovered" with no money-movement evidence behind it; a single, reused-everywhere function is the only way to make that guarantee hold across both the batch pipeline and the interactive Playground |
+| Hybrid payment gateway | real Razorpay test-mode Payment Link when `RAZORPAY_KEY_ID`/`SECRET` are configured (webhook-confirmed, async); otherwise a deterministic in-house fake gateway (sync-resolved) | Payment Links support test-mode creation + test-mode `payment_link.paid` webhooks (verified against Razorpay docs) — a genuine capability, not invented; the fake path keeps offline demos and tests fully deterministic with the same "never raises, always degrades" posture as `llm.py` |
+| `PaymentLinkStatus` orthogonal to `PTPStatus` | two independent state machines on one `Event` | a promise-to-pay's future date and a same-session payment-link wait are different kinds of "not yet" — conflating them would corrupt `ptp.py`'s real grace-period logic |
+| `resolve_fake_capture` is pure | no `session`/DB argument, reads only in-memory `Event` fields | lets the stateless, sandboxed Playground call the exact same capture logic as the real pipeline without ever risking a write to the real store |
+| Simulate UI: chat bubbles + a separate structured log, not one or the other | `SimulateSession.tsx`'s two-column layout keeps the phone-style chat/call mockup *and* a timestamped Messaging/Call/Customer-Actions transcript panel, always both visible | a hand-drawn wireframe sketch the user provided this session called for exactly this split: a conversational view for "does this feel like a real interaction" and a structured, timestamped log for "what did the simulation engine actually decide" — collapsing them into one view (the pre-rewrite single-column tab-switcher) hid the audit-style detail a reviewer needs, especially for `click_payment_link` outcomes |
+| Payment-link-click outcomes get their own log line, not a chat bubble | rendered in the Customer Actions panel, distinct from `history` | mirrors the real pipeline's own posture (a capture is a distinct auditable event, `payment_captured`/`payment_capture_failed`, not conversation text) — folding it into a chat bubble would visually imply the capture was "just something someone said" |
+| `/pay/:token` is a page, not a drawer | `PayCheckout.tsx` renders full-screen outside `AppShell` | a real customer clicking an SMS/WhatsApp link has never seen the ops dashboard and shouldn't; a drawer implies dashboard context that doesn't exist for them |
 | Root-cause vocabulary | `RootCause` `StrEnum` in `store.py` (9 members), one Recovery intervention each | keeps Diagnosis output and Recovery routing in lockstep; DB column stays `str \| None` (no migration), enum enforced at the schema layer (`EventUpdate`) |
 | Cross-agent coupling | frozen `AGENTS_CONTRACT.md` (I/O table, `action` registry, stopping-rule constants, fraud signature, `payload` shapes) | agents are sequential at runtime but independent at build time — a contract lets the four modules be built in parallel by separate agents |
 | Recovery outcome | deterministic per `hash(event_id)` vs a per-intervention success rate | stable, repeatable demo + tests; no RNG in the pipeline |

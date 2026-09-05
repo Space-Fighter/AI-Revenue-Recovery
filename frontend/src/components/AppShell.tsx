@@ -8,7 +8,6 @@ const NAV = [
   { to: '/recovery', label: 'Recovery', end: false },
   { to: '/exceptions', label: 'Exceptions', end: false },
   { to: '/attention', label: 'Urgent attention', end: false },
-  { to: '/playground', label: 'Playground', end: false },
 ]
 
 function ThemeToggle() {

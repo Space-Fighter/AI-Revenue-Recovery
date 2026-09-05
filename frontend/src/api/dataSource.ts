@@ -13,6 +13,9 @@ import type {
   EventSimilarResponse,
   EventsResponse,
   MetricsBlock,
+  PaymentAttemptExhaustedResponse,
+  PaymentAttemptResponse,
+  PaymentPageResponse,
   PipelineRunResponse,
   PlaygroundAdvanceResponse,
   PlaygroundChannel,
@@ -20,6 +23,8 @@ import type {
   PlaygroundMode,
   PlaygroundOutcome,
   PlaygroundPayResponse,
+  PlaygroundSimState,
+  PlaygroundSpeaker,
   PlaygroundStartResponse,
   PlaygroundTurn,
   TicketDetailResponse,
@@ -157,6 +162,56 @@ const fixtureAgentReply = (
     outcome: 'ongoing',
     reasoning: '',
   }
+}
+
+const _normalizeMode = (mode: PlaygroundMode): 'custom' | 'ai' =>
+  mode === 'interactive' ? 'custom' : mode === 'auto' ? 'ai' : mode
+
+const fixtureDefaultSimState = (mode: PlaygroundMode): PlaygroundSimState => {
+  const norm = _normalizeMode(mode)
+  return {
+    mode: norm,
+    controlled_by: norm === 'custom' ? { agent: 'ai', customer: 'human' } : { agent: 'ai', customer: 'ai' },
+    sim_day: 1,
+    sim_hour: 9,
+    exchanges_today: 0,
+    attempts_so_far: 0,
+    escalation_stage: 0,
+    customer_last_responded_day: 1,
+    customer_response_probability: 0.7,
+    outstanding_asks: [],
+    last_reply_text: null,
+    capture_attempts: 0,
+  }
+}
+
+const fixtureFillSimState = (sim_state: PlaygroundSimState | undefined, mode: PlaygroundMode): PlaygroundSimState => {
+  const defaults = fixtureDefaultSimState(mode)
+  if (!sim_state) return defaults
+  return {
+    ...defaults,
+    ...sim_state,
+    controlled_by: { ...defaults.controlled_by, ...(sim_state.controlled_by ?? {}) },
+    outstanding_asks: [...(sim_state.outstanding_asks ?? [])],
+  }
+}
+
+const _ASK_PATTERNS: Record<string, string[]> = {
+  'wants a GST invoice': ['gst', 'tax invoice', 'invoice chahiye', 'bill chahiye'],
+  'wants the link resent via WhatsApp': ['whatsapp'],
+  'wants the link resent via email': ['email pe', 'email par', 'email bhej', 'mail kar'],
+  'wants a callback': ['call back', 'callback', 'phone karo', 'call me later'],
+  'wants more detail': ['more detail', 'explain more', 'samjhao thoda', 'elaborate'],
+}
+
+const fixtureTrackAsks = (asks: string[], message: string): string[] => {
+  const text = message.toLowerCase()
+  const next = [...asks]
+  for (const [label, keywords] of Object.entries(_ASK_PATTERNS)) {
+    if (next.includes(label)) continue
+    if (keywords.some((k) => text.includes(k))) next.push(label)
+  }
+  return next
 }
 
 const fixtureCustomerReply = (turnIndex: number): string => {
@@ -360,6 +415,8 @@ export const dataSource = {
     if (IS_LIVE) return api.startPlayground(eventId, mode, channel)
     const event = fixtureEvent(eventId)
     const opening: PlaygroundTurn = { speaker: 'agent', text: fixtureOpening(event) }
+    const sim_state = fixtureDefaultSimState(mode)
+    sim_state.last_reply_text = opening.text
     return settle({
       mode,
       channel: channel ?? fixtureChannel(event),
@@ -368,6 +425,7 @@ export const dataSource = {
       opening_turn: opening,
       outcome: 'ongoing',
       history: [opening],
+      sim_state,
     })
   },
 
@@ -376,52 +434,123 @@ export const dataSource = {
     history: PlaygroundTurn[],
     message: string,
     _channel: string,
+    opts?: { speaker?: PlaygroundSpeaker; outcome?: string; sim_state?: PlaygroundSimState },
   ): Promise<PlaygroundMessageResponse> {
-    if (IS_LIVE) return api.sendPlaygroundMessage(eventId, history, message, _channel)
+    if (IS_LIVE) return api.sendPlaygroundMessage(eventId, history, message, _channel, opts)
     const event = fixtureEvent(eventId)
     const persona = fixturePersona(event)
-    const withCustomer: PlaygroundTurn[] = [...history, { speaker: 'customer', text: message }]
-    const turnIndex = withCustomer.filter((h) => h.speaker === 'customer').length
+    const speaker = opts?.speaker ?? 'customer'
+    const withSpeaker: PlaygroundTurn[] = [...history, { speaker, text: message }]
+
+    if (speaker === 'agent') {
+      // Human took over the Resolver role — trust the declared outcome as-supplied.
+      const st = fixtureFillSimState(opts?.sim_state, opts?.sim_state?.mode ?? 'custom')
+      st.last_reply_text = message
+      const finalOutcome = (opts?.outcome as PlaygroundOutcome) ?? 'ongoing'
+      const result: PlaygroundMessageResponse = {
+        turn: { speaker: 'agent', text: message },
+        outcome: finalOutcome,
+        reasoning: 'human agent override (outcome supplied by the human reviewer)',
+        history: withSpeaker,
+        sim_state: st,
+      }
+      if (finalOutcome === 'escalated') {
+        result.escalation = {
+          reason: 'out_of_scope',
+          outstanding_asks: st.outstanding_asks,
+          last_customer_message: [...history].reverse().find((h) => h.speaker === 'customer')?.text ?? '',
+          root_cause: event.root_cause,
+          attempts_so_far: st.attempts_so_far,
+          conversation_summary: `${withSpeaker.length}-turn rehearsal conversation; human reviewer closed it out.`,
+        }
+      }
+      return settle(result)
+    }
+
+    const st = fixtureFillSimState(opts?.sim_state, opts?.sim_state?.mode ?? 'custom')
+    st.outstanding_asks = fixtureTrackAsks(st.outstanding_asks, message)
+    const turnIndex = withSpeaker.filter((h) => h.speaker === 'customer').length
     const result = fixtureAgentReply(persona.name, message, turnIndex)
+    st.attempts_so_far += 1
+    st.last_reply_text = result.reply
     const turn: PlaygroundTurn = { speaker: 'agent', text: result.reply }
-    return settle({
+    const newHistory = [...withSpeaker, turn]
+    const out: PlaygroundMessageResponse = {
       turn,
       outcome: result.outcome,
       reasoning: result.reasoning,
-      history: [...withCustomer, turn],
-    })
+      history: newHistory,
+      sim_state: st,
+    }
+    if (result.outcome === 'escalated') {
+      out.escalation = {
+        reason: /human|manager|supervisor/.test(message.toLowerCase())
+          ? 'customer_requested_human'
+          : st.attempts_so_far >= 3
+          ? 'max_attempts_exceeded'
+          : 'out_of_scope',
+        outstanding_asks: st.outstanding_asks,
+        last_customer_message: message,
+        root_cause: event.root_cause,
+        attempts_so_far: st.attempts_so_far,
+        conversation_summary: `${newHistory.length}-turn rehearsal conversation, no resolution reached.`,
+      }
+    }
+    return settle(out)
   },
 
   async advancePlayground(
     eventId: string,
     history: PlaygroundTurn[],
     _channel: string,
+    simState?: PlaygroundSimState,
   ): Promise<PlaygroundAdvanceResponse> {
-    if (IS_LIVE) return api.advancePlayground(eventId, history, _channel)
+    if (IS_LIVE) return api.advancePlayground(eventId, history, _channel, simState)
     const event = fixtureEvent(eventId)
     const persona = fixturePersona(event)
+    const st = fixtureFillSimState(simState, simState?.mode ?? 'ai')
     const turnIndex = history.filter((h) => h.speaker === 'customer').length
     const customerTurn: PlaygroundTurn = { speaker: 'customer', text: fixtureCustomerReply(turnIndex) }
     const withCustomer = [...history, customerTurn]
+    st.outstanding_asks = fixtureTrackAsks(st.outstanding_asks, customerTurn.text)
     const result = fixtureAgentReply(persona.name, customerTurn.text, turnIndex + 1)
+    st.attempts_so_far += 1
+    st.last_reply_text = result.reply
     const agentTurn: PlaygroundTurn = { speaker: 'agent', text: result.reply }
-    return settle({
+    const newHistory = [...withCustomer, agentTurn]
+    const out: PlaygroundAdvanceResponse = {
+      no_response: false,
       customer_turn: customerTurn,
       agent_turn: agentTurn,
       outcome: result.outcome,
       reasoning: result.reasoning,
-      history: [...withCustomer, agentTurn],
-    })
+      history: newHistory,
+      sim_state: st,
+    }
+    if (result.outcome === 'escalated') {
+      out.escalation = {
+        reason: st.attempts_so_far >= 3 ? 'max_attempts_exceeded' : 'out_of_scope',
+        outstanding_asks: st.outstanding_asks,
+        last_customer_message: customerTurn.text,
+        root_cause: event.root_cause,
+        attempts_so_far: st.attempts_so_far,
+        conversation_summary: `${newHistory.length}-turn rehearsal conversation, no resolution reached.`,
+      }
+    }
+    return settle(out)
   },
 
   async simulatePlaygroundPayment(
     eventId: string,
     history: PlaygroundTurn[],
     channel: string,
+    simState?: PlaygroundSimState,
   ): Promise<PlaygroundPayResponse> {
-    if (IS_LIVE) return api.simulatePlaygroundPayment(eventId, history, channel)
+    if (IS_LIVE) return api.simulatePlaygroundPayment(eventId, history, channel, simState)
     const event = fixtureEvent(eventId)
     const persona = fixturePersona(event)
+    const st = fixtureFillSimState(simState, simState?.mode ?? 'custom')
+    st.capture_attempts += 1
     const txId = `pay_sim_${eventId.slice(-4)}${Math.floor(Math.random() * 900 + 100)}`
     const turn: PlaygroundTurn = {
       speaker: 'agent',
@@ -434,11 +563,41 @@ export const dataSource = {
       history: [...history, turn],
       payment_id: txId,
       amount: persona.amount,
+      sim_state: st,
+      captured: true,
+      reason: 'captured',
     })
   },
 
   async runPipeline(): Promise<PipelineRunResponse> {
     if (IS_LIVE) return api.runPipeline()
     return settle(fx.pipelineRun)
+  },
+
+  // --- public payment-link checkout (/pay/:token) ---
+
+  async getPaymentPage(token: string): Promise<PaymentPageResponse> {
+    if (IS_LIVE) return api.getPaymentPage(token)
+    const event = fx.events.events.find((e) => e.payment_link_id === token)
+    if (!event) throw new Error(`no such payment link: ${token}`)
+    return settle({
+      token,
+      event_id: event.event_id,
+      customer_name: event.customer_name ?? event.customer_id,
+      amount: event.amount,
+      currency: event.currency,
+      payment_link_status: event.payment_link_status ?? 'awaiting_capture',
+      attempts_made: 0,
+      attempts_remaining: 3,
+    })
+  },
+
+  async attemptPayment(
+    token: string,
+  ): Promise<PaymentAttemptResponse | PaymentAttemptExhaustedResponse> {
+    if (IS_LIVE) return api.attemptPayment(token)
+    // Fixture mode has no server-side attempt counter; simulate a single
+    // successful capture so the page's happy path can be exercised offline.
+    return settle({ captured: true, reason: 'captured', attempts_remaining: 2 })
   },
 }

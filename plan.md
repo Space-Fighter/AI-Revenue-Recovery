@@ -166,6 +166,7 @@ Repo is a monorepo: FastAPI **backend/** + React **frontend/**. See
 | `root_cause` | filled by Diagnosis Agent |
 | `diagnosis_confidence` | float 0–1 |
 | `recovered_amount` | float, 0 until recovered |
+| `payment_link_id`, `payment_link_url`, `payment_link_status`, `payment_link_sent_at`, `payment_capture_source`, `customer_fake_balance` | the unified payment-capture engine (`app/agents/payment.py`, 2026-09-05) — `recovered_amount`/`status="recovered"` are set ONLY when `payment_link_status` reaches `captured`, via `apply_capture`. See §12 below and `AGENTS_CONTRACT.md` §11. |
 
 ### `audit_log` table
 | column | notes |
@@ -445,6 +446,56 @@ This project is being built *for* Razorpay, evaluated *by* Razorpay engineers, o
   level, full `MetricsBlock` comparison). The brief §6 does not describe a
   "judge playtesting" mode; this is a deliberate addition because the submission
   will be demoed live.
+- **Payment-capture integrity fix — in progress (2026-09-05, Phase A of a
+  team-lead + 2-builder round):** a second AI agent's follow-on Playground work
+  had left `recovery.py._resolve_outcome` marking `status="recovered"` via a
+  hard-coded coin flip (`SUCCESS_RATES` + `_stable_hash`) with **no payment
+  capture, conversation outcome, or PTP behind it** — the user caught this by
+  hand as a genuine "we could lose the hackathon" risk (a judge could see
+  "recovered" events with nothing behind them). Fix: one unified capture engine
+  (`app/agents/payment.py`, new) — a hybrid real-Razorpay-test-mode Payment
+  Link (webhook-confirmed, when `RAZORPAY_KEY_ID`/`SECRET` are set) /
+  deterministic fake-gateway (sync-resolved) path — becomes the **only** place
+  `Event.status` ever becomes `recovered` from a capture, reused by both the
+  batch pipeline and the Playground. New `PaymentLinkStatus` enum + 6 `Event`
+  columns (§5 above); `recovery.py._resolve_outcome` will be rewritten by
+  team-lead personally (the highest-stakes edit in this round) to call
+  `payment.create_payment_link` instead of the coin flip. Confirmed via
+  Razorpay docs research this session: Payment Links support real test-mode
+  creation (`POST /v1/payment_links`, amount in paise, `reference_id` ≤ 40
+  chars, `notes` up to 15 pairs/256 chars each, response `id` prefixed
+  `plink_...`, `status` one of `created`/`paid`/`expired`/`cancelled`/
+  `partially_paid`) and test-mode webhooks genuinely fire `payment_link.paid`
+  on a real test payment — this repo's webhook listener already names that
+  event in `SUCCESS_EVENTS` but had never wired it up. Alongside this, the
+  Simulate/Playground engine (§ "Simulate / Playground" above) is being
+  redesigned for two named modes with either-side takeover, a multi-day game
+  clock advancing on natural conversation pauses (never a raw message-count
+  cap), and two distinct structured escalation triggers, plus a liquid-glass
+  restyle to match `DetailDrawer.tsx`'s existing drawer system. Full plan at
+  `C:\Users\Tejas Jain\.claude\plans\we-ought-to-have-recursive-scroll.md`; see
+  `AGENTS_CONTRACT.md` §11/§12 for the frozen `payment.py` signatures and
+  Playground `sim_state` shape. **Phases A/B/C all landed (2026-09-05):**
+  `app/agents/payment.py` built (payment-engine-builder) with the webhook
+  capture wiring and the new `/pay/:token` router (mounted by team-lead in
+  `main.py`); `app/agents/playground.py` fully rewritten (simulation-engine-builder)
+  with modes/takeover/game-clock/escalation/`click_payment_link`;
+  `recovery.py._resolve_outcome` rewritten by team-lead personally to call the
+  new engine instead of the coin flip; `routes.py`'s playground endpoints
+  migrated to the new mode default + `sim_state`/`speaker`/`outcome` fields.
+  **A real operational hazard surfaced and was fixed during this pass:** this
+  dev machine's `.env` has real Razorpay test-mode keys configured, and
+  `pipeline.run()` already defaults to `get_settings()` — without a fix, every
+  full-pipeline test run would have called the real Payment Links API for each
+  diagnosed event, burning the 30-test-link quota and leaving most events
+  non-terminal. Fixed with a new autouse `_no_real_razorpay` fixture in
+  `tests/conftest.py` (same isolation posture as the existing
+  `_offline_embeddings` fixture). Frontend liquid-glass restyle + Simulation
+  settings panel (plan's §4/§5) dispatched to `frontend-builder` next; docs
+  deltas (`documentation.md`, `architecture.md`, `history.md`) applied in this
+  same pass per §13's rules.
+- **Systemized Unified Audit Log & Customer Action Trail (2026-09-05):**
+  Unified the AI pipeline decision trail and simulation event logs into one standardized, systemized, color-coded audit log component (`AuditTimeline.tsx`). Customer actions (link clicks, OTP entries, customer replies, calls answered, silence) elevated to first-class audit events; strict chronological sorting merges store records and live simulation events via a monotonic `sortKey`; 7 semantic color-coded categories with interactive filter pills; specialized inline cards for Payment Links, Mandate Renewals, and verified Payment Captures. Deployed across `TicketDrawer.tsx`, `DetailDrawer.tsx`, and `SimulateSession.tsx` Column 2.
 - **Approved deviations from this brief:** PostgreSQL (not SQLite) — run as a
   local process via `scripts/pg.ps1` since Docker needs WSL2 (unavailable on this
   Win 11 Home box); `uv` (not `pip`/`requirements.txt`); a FastAPI **backend/** +

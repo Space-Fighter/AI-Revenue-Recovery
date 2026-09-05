@@ -11,9 +11,7 @@ import { SimilarCases } from './SimilarCases'
 import { AuditTimeline } from './AuditTimeline'
 import { StatusPill } from './StatusPill'
 import { Skeleton, ErrorState } from './Feedback'
-import { VoiceCallDrawer } from './VoiceCallDrawer'
 import { SimulateSession } from './SimulateSession'
-import { PTPModal } from './PTPModal'
 import { SequencerTimeline } from './SequencerTimeline'
 import type { EventRead } from '../api/types'
 
@@ -99,8 +97,6 @@ export function DetailDrawer({
   caseId: string | null
   onClose: () => void
 }) {
-  const [voiceOpen, setVoiceOpen] = useState(false)
-  const [ptpOpen, setPtpOpen] = useState(false)
   const [simulateOpen, setSimulateOpen] = useState(false)
   const drawerRef = useRef<HTMLDivElement>(null)
 
@@ -170,22 +166,14 @@ export function DetailDrawer({
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => setVoiceOpen(true)}
-                    className="px-2.5 py-1.5 text-xs font-medium rounded-xl bg-blue-500/10 hover:bg-blue-500/20 text-blue-300 border border-blue-500/30 transition-all hover:scale-105 active:scale-95 cursor-pointer shadow-sm"
-                  >
-                    🎙️ Voice Script
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setPtpOpen(true)}
-                    className="px-2.5 py-1.5 text-xs font-medium rounded-xl bg-amber-500/10 hover:bg-amber-500/20 text-amber-300 border border-amber-500/30 transition-all hover:scale-105 active:scale-95 cursor-pointer shadow-sm"
-                  >
-                    🤝 Record PTP
-                  </button>
-                  <button
-                    type="button"
                     onClick={() => setSimulateOpen(true)}
-                    className="px-2.5 py-1.5 text-xs font-bold rounded-xl bg-gradient-to-r from-purple-600/30 to-indigo-600/30 hover:from-purple-600/50 hover:to-indigo-600/50 text-purple-200 border border-purple-500/40 transition-all hover:scale-105 active:scale-95 cursor-pointer shadow-md"
+                    title="Roleplay this case as a two-AI text chat — sandboxed rehearsal, nothing is saved"
+                    aria-pressed={simulateOpen}
+                    className={`px-2.5 py-1.5 text-xs font-bold rounded-xl border transition-all hover:scale-105 active:scale-95 cursor-pointer shadow-md ${
+                      simulateOpen
+                        ? 'bg-gradient-to-r from-purple-600/60 to-indigo-600/60 text-white border-purple-400/70 ring-2 ring-purple-400/40'
+                        : 'bg-gradient-to-r from-purple-600/30 to-indigo-600/30 hover:from-purple-600/50 hover:to-indigo-600/50 text-purple-200 border-purple-500/40'
+                    }`}
                   >
                     🧪 Simulate
                   </button>
@@ -214,19 +202,6 @@ export function DetailDrawer({
         </div>
       </div>
 
-      <VoiceCallDrawer
-        eventId={caseId}
-        isOpen={voiceOpen}
-        onClose={() => setVoiceOpen(false)}
-      />
-
-      <PTPModal
-        eventId={caseId}
-        isOpen={ptpOpen}
-        onClose={() => setPtpOpen(false)}
-        onSuccess={() => state.reload()}
-      />
-
       <SimulateSession
         eventId={caseId}
         isOpen={simulateOpen}
@@ -235,3 +210,4 @@ export function DetailDrawer({
     </>
   )
 }
+

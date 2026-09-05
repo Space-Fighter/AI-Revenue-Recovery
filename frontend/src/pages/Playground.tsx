@@ -57,24 +57,37 @@ const columns: Column<EventRead>[] = [
   },
 ]
 
+type DataSourceMode = 'synthetic' | 'razorpay_test_mode'
+
 export function Playground() {
   const { data, loading, error } = useAsync(() => dataSource.getEvents())
   const [params, setParams] = useSearchParams()
   const [search, setSearch] = useState('')
+  const [sourceMode, setSourceMode] = useState<DataSourceMode>('synthetic')
 
   const events = useMemo(() => data?.events ?? [], [data])
   const simulateId = params.get('simulate')
 
+  const hasRazorpayLinks = useMemo(
+    () => events.some((e) => (e.payment_link_id ?? '').startsWith('plink_')),
+    [events],
+  )
+
+  const scoped = useMemo(() => {
+    if (sourceMode !== 'razorpay_test_mode' || !hasRazorpayLinks) return events
+    return events.filter((e) => (e.payment_link_id ?? '').startsWith('plink_'))
+  }, [events, sourceMode, hasRazorpayLinks])
+
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
-    if (!q) return events
-    return events.filter(
+    if (!q) return scoped
+    return scoped.filter(
       (e) =>
         e.event_id.toLowerCase().includes(q) ||
         e.customer_id.toLowerCase().includes(q) ||
         (e.customer_name ?? '').toLowerCase().includes(q),
     )
-  }, [events, search])
+  }, [scoped, search])
 
   if (loading) return <Skeleton rows={12} />
   if (error) return <ErrorState message={error} />
@@ -89,6 +102,45 @@ export function Playground() {
           to the dashboard or counted in the metrics.
         </p>
       </div>
+
+      <Card title="Simulation settings">
+        <div className="flex flex-col gap-2">
+          <label className="text-xs font-medium text-ink-soft">Data source</label>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => setSourceMode('synthetic')}
+              className={`rounded-lg px-3 py-1.5 text-xs font-medium ring-1 ring-[var(--color-ring)] ${
+                sourceMode === 'synthetic' ? 'bg-surface-2 text-ink' : 'text-ink-soft hover:text-ink'
+              }`}
+            >
+              Synthetic seed batch
+            </button>
+            <button
+              type="button"
+              onClick={() => hasRazorpayLinks && setSourceMode('razorpay_test_mode')}
+              disabled={!hasRazorpayLinks}
+              className={`rounded-lg px-3 py-1.5 text-xs font-medium ring-1 ring-[var(--color-ring)] disabled:cursor-not-allowed disabled:opacity-50 ${
+                sourceMode === 'razorpay_test_mode' ? 'bg-surface-2 text-ink' : 'text-ink-soft hover:text-ink'
+              }`}
+            >
+              Razorpay test-mode records only
+            </button>
+          </div>
+          {!hasRazorpayLinks && (
+            <p className="text-[11px] text-ink-muted">
+              No Razorpay test-mode payment links (`plink_...`) found in this dataset — no Razorpay
+              test-mode keys are configured on the backend for this run, so every case here used the
+              fake gateway instead. This toggle is disabled until real test-mode links exist.
+            </p>
+          )}
+          {hasRazorpayLinks && sourceMode === 'razorpay_test_mode' && (
+            <p className="text-[11px] text-ink-muted">
+              Showing only cases backed by a genuine Razorpay test-mode Payment Link.
+            </p>
+          )}
+        </div>
+      </Card>
 
       <Card
         title="Pick a case to simulate"

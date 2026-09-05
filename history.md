@@ -4,6 +4,145 @@ Running changelog. Newest entry first. Each entry is a short brief; the full
 reference lives in [documentation.md](documentation.md) and
 [architecture.md](architecture.md).
 
+## 2026-09-05 — Systemized Unified Audit Log & Customer Action Trail
+
+- **Did:** Unified the AI pipeline decision trail and simulation event logs into one standardized, systemized, color-coded audit log component (`frontend/src/components/AuditTimeline.tsx`), deployed consistently across Ticket Details (`TicketDrawer.tsx`), Case Details (`DetailDrawer.tsx`), and the Simulation Sandbox (`SimulateSession.tsx` Column 2):
+  - **First-Class Customer Actions (`👤 Customer`)**: Customer actions (clicking payment links, viewing fake checkout page, submitting OTPs, typing replies, speaking on call, agreeing to Promise-to-Pay, or silence) are now recorded as explicit first-class audit events in the log.
+  - **Strict Chronological Ordering**: Unified sorting engine parses ISO UTC timestamps and simulation game clock offsets into a monotonic `sortKey`, guaranteeing historical batch decisions and live customer interactions are woven together in exact occurrence order.
+  - **Semantic Color Coding & Category Filter Bar**: Categorizes all events into 7 distinct visual themes (Payments 💳 with Emerald/Cyan badges, Customer Actions 👤 with Warm Amber cards, Interventions ⚡ with Purple pills, Diagnosis 🔍 with Sky Blue, Commitments 🤝 with Teal, Safety & Halts 🛡️ with Crimson alerts, Human Review 🧑‍💼 with Orange tags, and Sandbox 🧪 markers). Category filter pills at the top allow instantaneous filtering by event type with live item count badges.
+  - **Specialized Inline Event Cards**: Clickable Payment Link cards (with link ID, token URL button, amount), Mandate Renewal & Re-auth cards, glowing verified Payment Captured cards with receipt amounts, and Promise-to-Pay commitment deadline cards.
+  - **SimulateSession Revamp**: Column 2 ("Unified Audit & Event Trail") pre-loads the event's historical DB decision trail and seamlessly appends live simulation events in real time.
+
+---
+
+## 2026-09-05 — Payment-capture integrity fix + Playground redesign
+
+- **Did:** A second AI agent's follow-on Playground work had left
+  `recovery.py._resolve_outcome` marking `status="recovered"` via a hard-coded
+  coin flip (`_stable_hash(event_id) % 100 < p`) with **no payment capture,
+  conversation outcome, or PTP behind it** — the user caught this by hand as a
+  genuine "we could lose the hackathon" risk (a judge could see "recovered"
+  events with nothing behind them). Fixed with a team-lead + 2-builder round:
+  - **New `backend/app/agents/payment.py`** (payment-engine-builder) — the
+    single unified capture engine. `create_payment_link` (real Razorpay
+    test-mode `POST /v1/payment_links` when `RAZORPAY_KEY_ID`/`SECRET` are
+    configured, else a deterministic `fake_{event_id}` link; any HTTP failure
+    degrades silently to the fake path); `resolve_fake_capture` (**pure**, no
+    session/DB access, reuses `recovery.SUCCESS_RATES`/`_stable_hash`,
+    hash-salted on `f"{event_id}:{link_id}:{attempt}"` so a bounded retry can
+    genuinely vary — this exact bug, a retry replaying the identical failure
+    forever, was caught and fixed during the Phase B0 plan review before any
+    code was written); `apply_capture` — **the only place `Event.status`
+    becomes `RECOVERED` from a capture**, always logging with
+    `agent=Agent.RECOVERY`. New `PaymentLinkStatus` enum + 6 `Event` columns.
+  - **`app/webhooks/listener.py`** wired to consume `payment.captured`/
+    `payment_link.paid` via a new `CAPTURE_EVENTS` entity-key map, idempotent
+    against redelivery.
+  - **New `app/api/payment_routes.py`** — `/pay/:token` fake-checkout surface
+    (`GET` display data, `POST .../attempt` a real DB write via
+    `resolve_fake_capture`+`apply_capture`, bounded to 3 attempts, **HTTP 409**
+    past that), mounted in `main.py` by team-lead.
+  - **`recovery.py._resolve_outcome` rewritten by team-lead personally** (the
+    single highest-stakes edit in this round) — sends a payment link and
+    stamps it onto the event; a real Razorpay link stays
+    `action_taken`/`AWAITING_CAPTURE` (async webhook); a fake link resolves
+    synchronously inline (no live human to click it in a batch run). A
+    `marked_recovered` echo is kept for `audit.compute_metrics`'s
+    `avg_hours_to_recovery` (fake-gateway path only — documented as such).
+  - **`app/agents/playground.py` fully rewritten** (simulation-engine-builder)
+    — `"custom"`/`"ai"` modes (legacy `"interactive"`/`"auto"` still accepted)
+    with either-side takeover via `sim_state.controlled_by`; a multi-day game
+    clock (`sim_day`/`sim_hour`/`exchanges_today`) that advances on a natural
+    pause (silence, explicit deferral, cadence) never a raw message-count cap;
+    two distinct structured escalation triggers
+    (`customer_requested_human` vs `out_of_scope`/`max_attempts_exceeded`,
+    reusing `recovery.py`'s real stopping-rule constants); `outstanding_asks`
+    tracking + anti-repetition fixes for the deterministic no-LLM fallback
+    (the actual source of the previously-reported verbatim-repeat bug);
+    `click_payment_link` (renamed from `simulate_payment`, alias kept) calls
+    the pure `resolve_fake_capture` and **never** `apply_capture` — proven by
+    a spy/mock test asserting zero calls.
+  - **`routes.py`** playground endpoints migrated to the new mode default
+    (`"custom"`) + `sim_state`/`speaker`/`outcome` request fields and
+    `sim_state`/`escalation`/`no_response` response fields; legacy mode
+    strings still accepted at the HTTP layer for backward compatibility.
+  - **A real operational hazard was found and fixed mid-pass:** this dev
+    machine's `.env` has live Razorpay test-mode keys configured, and
+    `pipeline.run()` already defaults to `get_settings()` — without a fix,
+    every full-pipeline test run would call the real Payment Links API for
+    each diagnosed event, burn the 30-test-link quota, and leave most events
+    non-terminal (`AWAITING_CAPTURE`). Fixed with a new autouse
+    `_no_real_razorpay` fixture in `tests/conftest.py` (same isolation posture
+    as the existing `_offline_embeddings` fixture).
+  - Fixed two now-outdated `test_api.py` assertions that assumed the old
+    always-succeeds payment simulation: `test_playground_interactive_message_reaches_an_outcome`
+    now asserts the full `{captured, reason, outcome, payment_id}` contract for
+    either branch instead of hard-coding `outcome=="resolved"`;
+    `test_playground_never_touches_the_real_store_or_metrics` excludes
+    `tickets.oldest_open_hours` (a genuine wall-clock-derived metric, not a
+    store mutation) from its strict equality check.
+  - **Frontend, two passes, both verified on disk (not just self-reported):**
+    pass 1 — liquid-glass restyle of `SimulateSession.tsx`/`VoiceCallDrawer.tsx`
+    (emoji/gradients/`hover:scale-*` removed), new standalone `PayCheckout.tsx`
+    page (`/pay/:token`, restructured `App.tsx` so it renders outside
+    `AppShell`), a "Simulation settings" data-source toggle on `Playground.tsx`
+    (filters to `payment_link_id` starting `plink_`), and `sim_state`/
+    `escalation`/`no_response`/payment types threaded through `types.ts`/
+    `dataSource.ts`/`client.ts`. Pass 2 — the user hand-drew two wireframe
+    sketches mid-session describing a structure pass 1 hadn't fully captured:
+    `SimulateSession.tsx`'s live view rebuilt as a **two-column layout**
+    (drawer widened to `max-w-5xl`) — phone-style chat/call mockup on the left
+    with a "Take over this simulation" + "View Transcripts" control pairing at
+    its top, and an always-visible structured, timestamped transcript-log
+    panel on the right with three named sub-panels (Messaging Transcript, Call
+    Transcript, Customer Actions) — critically, `click_payment_link` outcomes
+    now log as distinct timestamped Customer Actions entries instead of being
+    folded into chat bubbles. A stray `setState`-in-effect lint warning in
+    `PayCheckout.tsx` was fixed directly (redundant `setStep('loading')` next
+    to the state's own initial value). `npm run build` + `npm run lint` both
+    clean after each pass, re-verified independently.
+- **Verified:** Razorpay Payment Links API shape re-confirmed via WebFetch this
+  session (`POST /v1/payment_links`, amount in paise, `reference_id` ≤ 40
+  chars, `notes` ≤ 15 pairs/256 chars, response `id` prefixed `plink_...`,
+  `status` ∈ {created, paid, expired, cancelled, partially_paid}) — matches
+  the plan exactly; test-mode `payment_link.paid` webhooks are a genuine,
+  documented Razorpay capability, not invented. Backend: a clean, non-concurrent
+  full `uv run pytest -q` run confirmed 256 passed / 9 failed, all 9 failures
+  pre-existing pgvector-unavailable cases in `test_rag.py` (this session's
+  Postgres is the embedded `scripts/pg.ps1` fallback, no `vector` extension) —
+  unrelated to this round's changes. Frontend: final `npm run build` + `npm run
+  lint` both clean.
+- **Docs:** `AGENTS_CONTRACT.md` §11 (payment engine), §12 (Playground
+  `sim_state`), §13 (P1-P8/S1-S7 resolved questions); `plan.md` §5/§12;
+  `architecture.md` §2 (pipeline diagram gains the `PAY` node), §4 (ERD), §5.2
+  (new payment-link lifecycle diagram), §6.2 (Simulate sequence redesign
+  note), §7 (2 new component rows), §8 (7 new design-decision entries —
+  4 backend + 3 frontend); `documentation.md` §3.3, §3.4, §3.5, §4, §5, §13.
+- **Next:** verify the real-Razorpay webhook path by hand against a live
+  test-mode account (test-mode webhook simulator or a hand-crafted signed
+  `payment_link.paid` payload) — not exercised by the automated test suite by
+  design (`_no_real_razorpay`); consider code-splitting the frontend bundle
+  (Vite warns the main chunk is >500 kB post-minification, pre-existing, not
+  a regression from this round); pitch video.
+- **Same-day follow-up — fake gateway made the default even with Razorpay
+  keys configured (P9):** manual verification against the user's real
+  test-mode account immediately surfaced the exact live consequence of the
+  30-link-per-business test-mode cap: their account had already exhausted it,
+  so every `create_payment_link` call was failing with `429
+  RATE_LIMIT_EXCEEDED` and silently falling back to the fake gateway anyway —
+  correct behaviour per the "never raise" contract, but confusing (no visible
+  signal that the real path was ever attempted). Added
+  `settings.use_real_razorpay_payment_links` (default `False`) and
+  `payment._should_use_real_razorpay(settings)` — the real API is now only
+  attempted when both keys are configured **and** this flag is explicitly
+  set; otherwise `create_payment_link` goes straight to the fake link, no
+  attempt made. Updated `AGENTS_CONTRACT.md` (P9), `.env.example`, and
+  `documentation.md`'s config table; added
+  `test_should_use_real_razorpay_requires_explicit_opt_in` and
+  `test_create_payment_link_never_calls_real_api_when_opt_in_is_false` to
+  `test_payment.py` (25/25 passing), and retrofitted the 3 existing
+  real-path tests with the new opt-in flag.
+
 ---
 
 ## 2026-09-04 — Liquid Glass Display: Apple-Style Refraction for Side Windows (Ticket & Case Drawers)

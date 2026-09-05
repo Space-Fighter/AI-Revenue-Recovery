@@ -7,6 +7,9 @@ import type {
   EventVoiceResponse,
   EventVoiceAudioResponse,
   MetricsBlock,
+  PaymentAttemptExhaustedResponse,
+  PaymentAttemptResponse,
+  PaymentPageResponse,
   PipelineRunResponse,
   TicketDetailResponse,
   TicketMutationResponse,
@@ -16,6 +19,8 @@ import type {
   PlaygroundMessageResponse,
   PlaygroundMode,
   PlaygroundPayResponse,
+  PlaygroundSimState,
+  PlaygroundSpeaker,
   PlaygroundStartResponse,
   PlaygroundTurn,
 } from './types'
@@ -97,23 +102,65 @@ export const api = {
     history: PlaygroundTurn[],
     message: string,
     channel: string,
+    opts?: { speaker?: PlaygroundSpeaker; outcome?: string; sim_state?: PlaygroundSimState },
   ) =>
     request<PlaygroundMessageResponse>(
       `/api/events/${encodeURIComponent(eventId)}/playground/message`,
-      { method: 'POST', body: JSON.stringify({ history, message, channel }) },
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          history,
+          message,
+          channel,
+          speaker: opts?.speaker,
+          outcome: opts?.outcome,
+          sim_state: opts?.sim_state,
+        }),
+      },
     ),
-  advancePlayground: (eventId: string, history: PlaygroundTurn[], channel: string) =>
+  advancePlayground: (
+    eventId: string,
+    history: PlaygroundTurn[],
+    channel: string,
+    simState?: PlaygroundSimState,
+  ) =>
     request<PlaygroundAdvanceResponse>(
       `/api/events/${encodeURIComponent(eventId)}/playground/advance`,
-      { method: 'POST', body: JSON.stringify({ history, channel }) },
+      { method: 'POST', body: JSON.stringify({ history, channel, sim_state: simState }) },
     ),
-  simulatePlaygroundPayment: (eventId: string, history: PlaygroundTurn[], channel: string) =>
+  simulatePlaygroundPayment: (
+    eventId: string,
+    history: PlaygroundTurn[],
+    channel: string,
+    simState?: PlaygroundSimState,
+  ) =>
     request<PlaygroundPayResponse>(
       `/api/events/${encodeURIComponent(eventId)}/playground/pay`,
-      { method: 'POST', body: JSON.stringify({ history, channel }) },
+      { method: 'POST', body: JSON.stringify({ history, channel, sim_state: simState }) },
     ),
 
   getMetrics: () => request<MetricsBlock>('/api/metrics'),
   runPipeline: () =>
     request<PipelineRunResponse>('/api/pipeline/run', { method: 'POST' }),
+
+  // --- public payment-link checkout (/pay/:token, no dashboard chrome) ---
+  getPaymentPage: (token: string) =>
+    request<PaymentPageResponse>(`/api/pay/${encodeURIComponent(token)}`),
+  attemptPayment: async (
+    token: string,
+  ): Promise<PaymentAttemptResponse | PaymentAttemptExhaustedResponse> => {
+    const res = await fetch(`${BASE}/api/pay/${encodeURIComponent(token)}/attempt`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+    })
+    // 409 = attempts exhausted; a real, documented terminal state, not an error.
+    if (res.status === 409) {
+      return (await res.json()) as PaymentAttemptExhaustedResponse
+    }
+    if (!res.ok) {
+      const body = await res.text()
+      throw new Error(`${res.status} ${res.statusText}: ${body}`)
+    }
+    return (await res.json()) as PaymentAttemptResponse
+  },
 }
