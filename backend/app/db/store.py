@@ -36,8 +36,8 @@ from typing import Any, Iterable
 
 from dotenv import load_dotenv
 from pydantic import ConfigDict, field_validator
-from sqlalchemy import Column, DateTime, Index, text
-from sqlalchemy.dialects.postgresql import JSONB
+from sqlalchemy import Column, DateTime, Index, text, JSON as JSONB
+# from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, Session, SQLModel, create_engine, select
 
 try:  # pgvector is optional — RAG is disabled on a Postgres without it

@@ -521,6 +521,7 @@ def _handle_escalation(
             "stage": stage,
             "stage_name": stage_name,
             "message": message,
+            "channel": _channel(event.amount),
             "contact_at": contact_at.isoformat(),
         },
     )

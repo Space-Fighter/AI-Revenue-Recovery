@@ -28,9 +28,12 @@ TEST_DATABASE_URL = os.environ.get(
 
 # short timeout so, when Postgres is down, DB tests fail in seconds instead of
 # hanging on the OS connect timeout
-_TEST_ENGINE = create_engine(
-    TEST_DATABASE_URL, connect_args={"connect_timeout": 3}
-)
+if TEST_DATABASE_URL.startswith("sqlite"):
+    _TEST_ENGINE = create_engine(TEST_DATABASE_URL)
+else:
+    _TEST_ENGINE = create_engine(
+        TEST_DATABASE_URL, connect_args={"connect_timeout": 3}
+    )
 
 
 @pytest.fixture(scope="session")
