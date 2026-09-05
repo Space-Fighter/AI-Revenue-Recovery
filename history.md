@@ -4,6 +4,65 @@ Running changelog. Newest entry first. Each entry is a short brief; the full
 reference lives in [documentation.md](documentation.md) and
 [architecture.md](architecture.md).
 
+## 2026-09-05 — Simulate tab Controls & Actions rework
+
+- **Did:** Fixed the Simulate tab's right-hand "Controls & Actions" panel
+  (`frontend/src/components/SimulateSession.tsx`), per user-reported UX
+  drift: removed the redundant "Tester Input" box (duplicated the live
+  WhatsApp chat input) and the "Simulate Customer Actions" button group (two
+  canned-string buttons plus a "Click Link & Pay" button that was disabled
+  exactly when it was needed, post-PTP); deleted the dead `logAction` no-op
+  stub and its ~10 call sites (the real logging path, `logSimulatedEvent`,
+  was always separate). Rebuilt the "AI Simulation Engine" card as one
+  vertical stack: Next Turn → Auto-Run → Out-of-Scope Query → Force Human
+  Escalation → Record Promise to Pay (PTP). PTP now behaves like a real
+  triage hand-off — a `ticketStatus` state (`'none'|'ptp_human_review'|'recovered'`)
+  shows a banner and disables the AI-engine buttons while the case is "with a
+  human," clearing to "recovered" once the customer later pays. Payment/mandate
+  links in any turn's text are now clickable (`renderMessageText` + `LINK_PATTERN`)
+  and open a new embedded fake-checkout screen swapped in for the WhatsApp
+  body (`phoneView: 'chat'|'checkout'`) — masked amount/customer header plus a
+  tester-picked mistake list (succeed / wrong OTP / wrong email-password /
+  press back / insufficient balance), with a "‹ Back to WhatsApp" bail-out
+  that makes no API call. Backend: dispatched `simulation-engine-builder` for
+  `backend/app/agents/playground.py` — added `click_payment_link(...,
+  forced_reason=None)`; `None` keeps the exact original random-roll behavior
+  via `payment.resolve_fake_capture` (regression-guarded); a tester-picked
+  value builds the `CaptureResult` locally (`wrong_password` is playground-only,
+  never added to `payment.py`'s frozen vocabulary); `insufficient_funds` never
+  escalates — it sets `sim_state.salary_reminder_day = sim_day + 5` (sandbox
+  stand-in for `recovery.SALARY_WINDOW_DAY`) and states the rescheduled day in
+  the reply. Wired `forced_reason` through `routes.py`'s `PlaygroundPayRequest`
+  and the frontend `types.ts`/`client.ts`/`dataSource.ts` (including the
+  offline-fixture path). `payment.py`, `payment_routes.py`, and `PayCheckout.tsx`
+  (the real DB-writing `/pay/:token` flow) were not touched.
+- **Verified:** No new Razorpay API surface — this is a sandboxed rehearsal
+  feature reusing already-verified test-mode failure reasons; no fresh source
+  re-check needed. `AGENTS_CONTRACT.md` §12/§13 updated with new decision-log
+  entry S9 by the builder agent.
+- **Docs:** `documentation.md` (Playground endpoint row, `playground.py` file
+  row, `SimulateSession.tsx`/`types.ts`/`dataSource.ts` rows, test inventory,
+  top changelog) and `architecture.md` (§6.2 new sequence diagram, §7
+  component row, §8 three new design-decision rows, top changelog) both
+  updated in this pass; `plan.md` §12 got a matching dated entry.
+- **Tests:** `uv run pytest tests/test_playground.py tests/test_api.py -q` →
+  66 passed. `npx tsc -b` and `npm run build` (frontend) both clean.
+- **Next:** Manually walk the golden path in a running dev server (Next
+  Turn/Auto-Run to a payment link → click it → try each mistake option →
+  successfully pay → confirm ticket-status banner clears) — not yet done this
+  session, only automated tests + type-checks were run.
+- **Follow-up same day:** user opened a call-mapped case (root cause
+  `insufficient_funds` etc. route to voice call via `pick_channel`) and got
+  the voice-call screen instead of WhatsApp — not a regression from this
+  session's work, but the new embedded-checkout/panel rework only exists on
+  the message rail. Fixed by having `SimulateSession.tsx`'s `begin()` always
+  request `channel: 'message'` explicitly from `startPlayground`, overriding
+  the root-cause auto-pick for the Simulate tab. Call-mode UI code is left in
+  place (untouched, just unreachable via the Simulate tab now) in case it's
+  wanted back later.
+
+---
+
 ## 2026-09-05 — Systemized Unified Audit Log & Customer Action Trail
 
 - **Did:** Unified the AI pipeline decision trail and simulation event logs into one standardized, systemized, color-coded audit log component (`frontend/src/components/AuditTimeline.tsx`), deployed consistently across Ticket Details (`TicketDrawer.tsx`), Case Details (`DetailDrawer.tsx`), and the Simulation Sandbox (`SimulateSession.tsx` Column 2):

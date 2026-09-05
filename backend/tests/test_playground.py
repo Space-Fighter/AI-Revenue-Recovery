@@ -536,7 +536,7 @@ def test_click_payment_link_increments_capture_attempts_and_escalates_after_thre
     event = _event()
 
     def _always_fails(evt, link_id, *, settings, attempt=1):
-        return {"captured": False, "reason": "insufficient_funds", "amount": evt.amount}
+        return {"captured": False, "reason": "wrong_otp", "amount": evt.amount}
 
     monkeypatch.setattr(pg.payment, "resolve_fake_capture", _always_fails)
 
@@ -568,3 +568,141 @@ def test_click_payment_link_success_never_unconditional(monkeypatch):
     assert result["outcome"] != "resolved"
     assert result["captured"] is False
     assert result["payment_id"] is None
+
+
+# --- click_payment_link forced_reason (tester-driven fake checkout, S9) -----
+
+def test_click_payment_link_forced_reason_none_uses_resolve_fake_capture(monkeypatch):
+    """Regression guard: omitting forced_reason (or passing None explicitly)
+    is byte-for-byte the existing random-roll path -- resolve_fake_capture is
+    still the source of truth."""
+    event = _event()
+    calls = {"n": 0}
+
+    def _fake_resolve(evt, link_id, *, settings, attempt=1):
+        calls["n"] += 1
+        return {"captured": False, "reason": "wrong_otp", "amount": evt.amount}
+
+    monkeypatch.setattr(pg.payment, "resolve_fake_capture", _fake_resolve)
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    result = pg.click_payment_link(
+        event, session["history"], "call", settings=_NO_LLM, forced_reason=None
+    )
+    assert calls["n"] == 1
+    assert result["reason"] == "wrong_otp"
+
+
+def test_click_payment_link_forced_success(monkeypatch):
+    event = _event()
+
+    def _boom(*a, **k):
+        raise AssertionError("resolve_fake_capture must not be called when forced_reason is set")
+
+    monkeypatch.setattr(pg.payment, "resolve_fake_capture", _boom)
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    result = pg.click_payment_link(
+        event, session["history"], "call", settings=_NO_LLM, forced_reason="success"
+    )
+    assert result["captured"] is True
+    assert result["reason"] == "captured"
+    assert result["outcome"] == "resolved"
+    assert result["payment_id"] is not None
+    assert "pay_sim_" in result["payment_id"]
+
+
+def test_click_payment_link_forced_wrong_otp(monkeypatch):
+    event = _event()
+    monkeypatch.setattr(
+        pg.payment, "resolve_fake_capture",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not be called")),
+    )
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    result = pg.click_payment_link(
+        event, session["history"], "call", settings=_NO_LLM, forced_reason="wrong_otp"
+    )
+    assert result["captured"] is False
+    assert result["reason"] == "wrong_otp"
+    assert result["outcome"] == "ongoing"
+    assert "OTP" in result["turn"]["text"]
+
+
+def test_click_payment_link_forced_wrong_password(monkeypatch):
+    event = _event()
+    monkeypatch.setattr(
+        pg.payment, "resolve_fake_capture",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not be called")),
+    )
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    result = pg.click_payment_link(
+        event, session["history"], "call", settings=_NO_LLM, forced_reason="wrong_password"
+    )
+    assert result["captured"] is False
+    assert result["reason"] == "wrong_password"
+    assert result["outcome"] == "ongoing"
+    assert "login" in result["turn"]["text"].lower() or "password" in result["turn"]["text"].lower()
+
+
+def test_click_payment_link_forced_user_cancelled(monkeypatch):
+    event = _event()
+    monkeypatch.setattr(
+        pg.payment, "resolve_fake_capture",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not be called")),
+    )
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    result = pg.click_payment_link(
+        event, session["history"], "call", settings=_NO_LLM, forced_reason="user_cancelled"
+    )
+    assert result["captured"] is False
+    assert result["reason"] == "user_cancelled"
+    assert result["outcome"] == "ongoing"
+
+
+def test_click_payment_link_forced_insufficient_funds_mentions_rescheduled_day(monkeypatch):
+    event = _event()
+    monkeypatch.setattr(
+        pg.payment, "resolve_fake_capture",
+        lambda *a, **k: (_ for _ in ()).throw(AssertionError("should not be called")),
+    )
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    st = session["sim_state"]
+    day_before = st["sim_day"]
+    result = pg.click_payment_link(
+        event, session["history"], "call", sim_state=st, settings=_NO_LLM,
+        forced_reason="insufficient_funds",
+    )
+    assert result["captured"] is False
+    assert result["reason"] == "insufficient_funds"
+    assert result["outcome"] == "ongoing"
+    expected_day = day_before + 5
+    assert result["sim_state"]["salary_reminder_day"] == expected_day
+    assert str(expected_day) in result["turn"]["text"]
+
+
+def test_click_payment_link_insufficient_funds_never_escalates_after_many_attempts(monkeypatch):
+    event = _event()
+
+    def _always_insufficient(evt, link_id, *, settings, attempt=1):
+        return {"captured": False, "reason": "insufficient_funds", "amount": evt.amount}
+
+    monkeypatch.setattr(pg.payment, "resolve_fake_capture", _always_insufficient)
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    st = session["sim_state"]
+    history = session["history"]
+    result = None
+    for _ in range(5):
+        result = pg.click_payment_link(event, history, "call", sim_state=st, settings=_NO_LLM)
+        history = result["history"]
+        st = result["sim_state"]
+
+    assert st["capture_attempts"] == 5
+    assert result["outcome"] == "ongoing"
+    assert "escalation" not in result
+
+
+def test_click_payment_link_has_no_session_parameter():
+    """Keeps guarding the pure/stateless contract (S2) -- this module must
+    never gain a `session` param."""
+    import inspect
+
+    params = inspect.signature(pg.click_payment_link).parameters
+    assert "session" not in params

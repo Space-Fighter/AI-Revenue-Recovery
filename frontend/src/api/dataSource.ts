@@ -12,6 +12,7 @@ import type {
   EventRead,
   EventSimilarResponse,
   EventsResponse,
+  ForcedPaymentReason,
   MetricsBlock,
   PaymentAttemptExhaustedResponse,
   PaymentAttemptResponse,
@@ -545,12 +546,45 @@ export const dataSource = {
     history: PlaygroundTurn[],
     channel: string,
     simState?: PlaygroundSimState,
+    forcedReason?: ForcedPaymentReason,
   ): Promise<PlaygroundPayResponse> {
-    if (IS_LIVE) return api.simulatePlaygroundPayment(eventId, history, channel, simState)
+    if (IS_LIVE) {
+      return api.simulatePlaygroundPayment(eventId, history, channel, simState, forcedReason)
+    }
     const event = fixtureEvent(eventId)
     const persona = fixturePersona(event)
     const st = fixtureFillSimState(simState, simState?.mode ?? 'custom')
     st.capture_attempts += 1
+
+    if (forcedReason && forcedReason !== 'success') {
+      const FAILURE_TEXT: Record<Exclude<ForcedPaymentReason, 'success'>, string> = {
+        wrong_otp: 'OTP verification galat ho gaya, payment complete nahi hua. Agli baar phone par aaya sahi 6-digit OTP dhyan se daalein.',
+        wrong_password: 'Aapke login credentials galat the, isliye payment complete nahi hua. Apna Razorpay/bank login verify karke dobara try karein.',
+        user_cancelled: 'Lagta hai payment complete hone se pehle hi aap back aa gaye. Is baar link khol kar OTP step tak process poora karein.',
+        insufficient_funds: '',
+      }
+      let text = FAILURE_TEXT[forcedReason]
+      if (forcedReason === 'insufficient_funds') {
+        st.salary_reminder_day = st.sim_day + 5
+        text = `Filhaal aapke account mein balance kam hai. Main aapko salary credit ke around, Day ${st.salary_reminder_day}, dobara reminder bhejunga.`
+      }
+      const turn: PlaygroundTurn = { speaker: 'agent', text }
+      return settle({
+        turn,
+        outcome: 'ongoing' as PlaygroundOutcome,
+        reasoning:
+          forcedReason === 'insufficient_funds'
+            ? `Payment failed: insufficient funds; rescheduled reminder to sim day ${st.salary_reminder_day}, no escalation.`
+            : `Payment attempt failed: ${forcedReason} (tester-selected at checkout).`,
+        history: [...history, turn],
+        payment_id: null,
+        amount: persona.amount,
+        sim_state: st,
+        captured: false,
+        reason: forcedReason,
+      })
+    }
+
     const txId = `pay_sim_${eventId.slice(-4)}${Math.floor(Math.random() * 900 + 100)}`
     const turn: PlaygroundTurn = {
       speaker: 'agent',

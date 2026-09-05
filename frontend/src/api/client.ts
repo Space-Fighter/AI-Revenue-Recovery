@@ -6,6 +6,7 @@ import type {
   EventsResponse,
   EventVoiceResponse,
   EventVoiceAudioResponse,
+  ForcedPaymentReason,
   MetricsBlock,
   PaymentAttemptExhaustedResponse,
   PaymentAttemptResponse,
@@ -133,10 +134,14 @@ export const api = {
     history: PlaygroundTurn[],
     channel: string,
     simState?: PlaygroundSimState,
+    forcedReason?: ForcedPaymentReason,
   ) =>
     request<PlaygroundPayResponse>(
       `/api/events/${encodeURIComponent(eventId)}/playground/pay`,
-      { method: 'POST', body: JSON.stringify({ history, channel, sim_state: simState }) },
+      {
+        method: 'POST',
+        body: JSON.stringify({ history, channel, sim_state: simState, forced_reason: forcedReason }),
+      },
     ),
 
   getMetrics: () => request<MetricsBlock>('/api/metrics'),

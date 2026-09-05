@@ -108,6 +108,14 @@ class PlaygroundPayRequest(BaseModel):
     sim_state: dict[str, Any] | None = Field(
         default=None, description="Game-clock/escalation state round-tripped from the previous response",
     )
+    forced_reason: str | None = Field(
+        default=None,
+        description=(
+            "Tester-picked checkout outcome ('success' | 'wrong_otp' | 'wrong_password' | "
+            "'user_cancelled' | 'insufficient_funds'); omitted/None keeps the existing "
+            "random-roll fake-gateway behavior"
+        ),
+    )
 
 
 @router.get("/events")
@@ -240,6 +248,7 @@ def playground_pay(event_id: str, body: PlaygroundPayRequest) -> dict[str, Any]:
         return playground.click_payment_link(
             event, body.history, body.channel,
             sim_state=body.sim_state, settings=get_settings(),
+            forced_reason=body.forced_reason,
         )
 
 

@@ -496,6 +496,35 @@ This project is being built *for* Razorpay, evaluated *by* Razorpay engineers, o
   same pass per §13's rules.
 - **Systemized Unified Audit Log & Customer Action Trail (2026-09-05):**
   Unified the AI pipeline decision trail and simulation event logs into one standardized, systemized, color-coded audit log component (`AuditTimeline.tsx`). Customer actions (link clicks, OTP entries, customer replies, calls answered, silence) elevated to first-class audit events; strict chronological sorting merges store records and live simulation events via a monotonic `sortKey`; 7 semantic color-coded categories with interactive filter pills; specialized inline cards for Payment Links, Mandate Renewals, and verified Payment Captures. Deployed across `TicketDrawer.tsx`, `DetailDrawer.tsx`, and `SimulateSession.tsx` Column 2.
+- **Simulate tab Controls & Actions rework (2026-09-05):** the panel had
+  drifted — a "Tester Input" box duplicating the live WhatsApp chat input, a
+  "Simulate Customer Actions" group with two canned-string buttons and a
+  third (Click Link & Pay) disabled at exactly the moment (post-PTP) it was
+  meant to be used, and payment/mandate links in the transcript were inert
+  text. Removed both redundant sections; the "AI Simulation Engine" card is
+  now one vertical stack: Next Turn → Auto-Run → Out-of-Scope Query → Force
+  Human Escalation → Record Promise to Pay (PTP). PTP now opens a simulated
+  ticket "with a human" (`ticketStatus` state — disables the AI-engine
+  buttons, only the payment-link path stays live) that clears to "recovered"
+  once the customer later pays. A payment/mandate link in any turn's text is
+  now clickable and opens a new embedded fake-checkout screen inside the
+  phone mockup (never a separate page — stays sandboxed) where the tester
+  explicitly picks the outcome: succeed, wrong OTP, wrong email/password,
+  press back before completing, or insufficient balance — with a "‹ Back to
+  WhatsApp" bail-out that makes no API call. Backed by a new `forced_reason`
+  param on `playground.click_payment_link` (dispatched to
+  `simulation-engine-builder`; `AGENTS_CONTRACT.md` §12/§13 new entry S9):
+  `None` (every existing caller) keeps the exact original random-roll
+  behavior via `payment.resolve_fake_capture`; a tester-picked reason builds
+  the `CaptureResult` locally instead — `wrong_password` is a **playground-only**
+  reason, never added to `payment.py`'s frozen `CaptureResult` vocabulary
+  (that module stays untouched, still shared with the real, DB-writing
+  `/pay/:token` flow). An `insufficient_funds` checkout failure never
+  escalates — it reschedules to `sim_state.salary_reminder_day = sim_day + 5`,
+  a bounded sandbox stand-in for `recovery.SALARY_WINDOW_DAY` (the real
+  constant targets a calendar day-of-month; `sim_day` has no calendar
+  backing). 50 backend tests green (`test_playground.py`, 13 new); full
+  `documentation.md`/`architecture.md` deltas applied same-pass.
 - **Approved deviations from this brief:** PostgreSQL (not SQLite) — run as a
   local process via `scripts/pg.ps1` since Docker needs WSL2 (unavailable on this
   Win 11 Home box); `uv` (not `pip`/`requirements.txt`); a FastAPI **backend/** +

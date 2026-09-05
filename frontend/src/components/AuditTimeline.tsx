@@ -30,6 +30,7 @@ export interface UnifiedAuditNode {
     rail?: string
     promisedDate?: string
     customerText?: string
+    reason?: string
   }
 }
 

@@ -37,8 +37,14 @@ Public API:
     advance_conversation(event, history, channel, *, sim_state=None,
                          settings=None) -> dict
     click_payment_link(event, history, channel="call", *, sim_state=None,
-                       settings=None) -> dict
+                       settings=None, forced_reason=None) -> dict
     simulate_payment = click_payment_link   # deprecated alias, S5
+
+``click_payment_link``'s optional ``forced_reason`` (S9) lets a tester-driven
+fake-checkout screen pick the outcome explicitly ("success" | "wrong_otp" |
+"wrong_password" | "user_cancelled" | "insufficient_funds") instead of the
+random weighted roll; ``forced_reason=None`` (default) is byte-for-byte the
+existing ``payment.resolve_fake_capture``-driven behavior.
 """
 
 from __future__ import annotations
@@ -56,8 +62,10 @@ from app.agents.recovery import (
     MAX_RETRY_ATTEMPTS,
 )
 from app.agents.recovery import _stable_hash as _recovery_stable_hash
+from decimal import Decimal
+
 from app.config import Settings, get_settings
-from app.db.store import Event, RootCause
+from app.db.store import MONEY, Event, RootCause
 
 # payment.py is being built in parallel (payment-engine builder). Import
 # defensively so this module still loads (and every existing test still
@@ -184,6 +192,11 @@ def _default_sim_state(mode: str) -> dict[str, Any]:
         "outstanding_asks": [],
         "last_reply_text": None,
         "capture_attempts": 0,
+        # 0 = "not scheduled". Sandbox stand-in for recovery.SALARY_WINDOW_DAY:
+        # this file has no calendar, only a relative sim_day counter, so an
+        # insufficient-funds failure reschedules a reminder `sim_day + 5`
+        # rather than targeting a real day-of-month (S9).
+        "salary_reminder_day": 0,
     }
 
 
@@ -891,10 +904,31 @@ def advance_conversation(
 
 # --- payment-link click (never touches the real store, never captures for real) --
 
+def _q(amount: Any) -> Decimal:
+    """Same rounding convention as payment.py's own `_q` (quantize to paise)
+    -- kept local so this module never imports a private helper across the
+    package boundary; the two must stay byte-for-byte equivalent."""
+    return Decimal(str(amount or 0)).quantize(MONEY)
+
+
+# cause + fix, same natural Hinglish tone as _ROOT_CAUSE_EXPLANATIONS /
+# _fallback_agent_reply. `insufficient_funds` deliberately has no generic
+# "try again" fix here -- it gets a salary-day reschedule message instead,
+# built inline in click_payment_link (point 3, S9).
 _CAPTURE_FAILURE_TEXT: dict[str, str] = {
-    "wrong_otp": "OTP verification galat ho gaya, payment complete nahi hua. Ek baar aur try karte hain?",
+    "wrong_otp": (
+        "OTP galat enter ho gaya isliye payment complete nahi hua. Agli baar apne phone par "
+        "aaya hua sahi 6-digit OTP dalein, phir se try karte hain?"
+    ),
+    "wrong_password": (
+        "Aapka Razorpay/bank login ya password galat tha, isliye payment OTP step tak pahunchne "
+        "se pehle hi fail ho gaya. Ek baar apna login verify karke dobara try kijiye."
+    ),
+    "user_cancelled": (
+        "Lagta hai aapne payment beech mein hi cancel/back kar diya tha, isliye transaction complete "
+        "nahi hua. Is baar link dobara kholiye aur OTP step tak poora complete kariye, beech mein back mat kijiye."
+    ),
     "insufficient_funds": "Account mein is waqt insufficient balance hai, payment complete nahi ho paya.",
-    "user_cancelled": "Lagta hai payment page par transaction cancel ho gaya. Koi issue hua kya?",
 }
 
 
@@ -905,19 +939,45 @@ def click_payment_link(
     *,
     sim_state: dict[str, Any] | None = None,
     settings: Settings | None = None,
+    forced_reason: str | None = None,
 ) -> dict[str, Any]:
-    """Simulates the customer clicking the payment link. Calls the PURE,
-    imported `payment.resolve_fake_capture` (never `payment.apply_capture` --
-    that writes to the DB and would break the sandboxing guarantee) and
-    renders wrong_otp / insufficient_funds / user_cancelled / success --
-    weighted, never an unconditional instant "resolved"."""
+    """Simulates the customer clicking the payment link. By default
+    (`forced_reason=None`) calls the PURE, imported `payment.resolve_fake_capture`
+    (never `payment.apply_capture` -- that writes to the DB and would break
+    the sandboxing guarantee) and renders wrong_otp / insufficient_funds /
+    user_cancelled / success -- weighted, never an unconditional instant
+    "resolved". This is a hard regression guard: existing callers that never
+    pass `forced_reason` see byte-for-byte unchanged behavior.
+
+    `forced_reason` (S9) lets a tester-driven fake-checkout screen pick the
+    outcome explicitly instead of the random roll: one of "success",
+    "wrong_otp", "wrong_password" (a playground-only reason, never added to
+    payment.py's CaptureResult vocabulary), "user_cancelled",
+    "insufficient_funds". Any other value is treated the same as None
+    (unforced/random). When set, `payment.resolve_fake_capture` is skipped
+    entirely and a CaptureResult-shaped dict is built locally with the same
+    `_q` paise-rounding convention `resolve_fake_capture` uses, so downstream
+    code sees an identical shape either way.
+
+    `insufficient_funds` never escalates regardless of attempt count -- it
+    reschedules a salary-day reminder instead (see the branch below, S9)."""
     s = settings or get_settings()
     persona = build_persona(event)
     st = _fill_sim_state(sim_state, mode=(sim_state or {}).get("mode", "custom"))
 
     attempt = st["capture_attempts"] + 1
     link_id = f"sim_{event.event_id}"  # playground-owned prefix (S4) -- never persisted
-    capture = payment.resolve_fake_capture(event, link_id, settings=s, attempt=attempt)
+
+    forced = forced_reason if forced_reason in (
+        "success", "wrong_otp", "wrong_password", "user_cancelled", "insufficient_funds",
+    ) else None
+
+    if forced == "success":
+        capture: dict[str, Any] = {"captured": True, "reason": "captured", "amount": _q(event.amount)}
+    elif forced is not None:
+        capture = {"captured": False, "reason": forced, "amount": _q(event.amount)}
+    else:
+        capture = payment.resolve_fake_capture(event, link_id, settings=s, attempt=attempt)
     st["capture_attempts"] = attempt
 
     captured = bool(capture["captured"])
@@ -936,10 +996,28 @@ def click_payment_link(
             f"(fake gateway capture, attempt {attempt}, link {link_id})."
         )
         payment_id: str | None = tx_id
+    elif reason == "insufficient_funds":
+        # Carve-out (S9): insufficient funds never escalates no matter how
+        # many attempts -- instead we schedule a salary-day reminder. sim_day
+        # is a relative counter, not a calendar date, so `+5` is a bounded,
+        # deterministic sandbox approximation of recovery.SALARY_WINDOW_DAY.
+        st["salary_reminder_day"] = st["sim_day"] + 5
+        reply_text = (
+            f"{_CAPTURE_FAILURE_TEXT['insufficient_funds']} Filhaal aapke account mein balance kam "
+            f"hai. Main aapko salary credit ke around, Day {st['salary_reminder_day']}, dobara "
+            f"reminder bhejunga."
+        )
+        outcome = "ongoing"
+        reasoning = (
+            f"Payment failed: insufficient funds; rescheduled reminder to sim day "
+            f"{st['salary_reminder_day']} (salary-credit-window analogue), no escalation."
+        )
+        payment_id = None
+        _advance_day(st)
     else:
         reply_text = _CAPTURE_FAILURE_TEXT.get(
             reason, "Payment link attempt fail ho gaya, ek baar phir try karte hain."
-        ).format()
+        )
         payment_id = None
         if attempt >= 3:
             outcome = "escalated"

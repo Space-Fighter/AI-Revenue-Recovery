@@ -337,7 +337,20 @@ export interface PlaygroundSimState {
   outstanding_asks: string[]
   last_reply_text: string | null
   capture_attempts: number
+  /** 0 = not scheduled. Sandbox stand-in for `recovery.SALARY_WINDOW_DAY` — a
+   * relative sim_day the agent has promised to remind the customer again on,
+   * set after an `insufficient_funds` checkout failure (never escalates). */
+  salary_reminder_day?: number
 }
+
+/** Tester-picked outcome at the embedded fake-checkout screen. `undefined`
+ * keeps the backend's existing random-roll fake-gateway behavior. */
+export type ForcedPaymentReason =
+  | 'success'
+  | 'wrong_otp'
+  | 'wrong_password'
+  | 'user_cancelled'
+  | 'insufficient_funds'
 
 export type PlaygroundEscalationReason =
   | 'customer_requested_human'
@@ -409,4 +422,5 @@ export interface PlaygroundPayResponse {
   sim_state?: PlaygroundSimState
   captured?: boolean
   reason?: string
+  escalation?: PlaygroundEscalation
 }

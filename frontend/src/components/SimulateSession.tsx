@@ -7,6 +7,7 @@ import { AuditTimeline, type UnifiedAuditNode } from './AuditTimeline'
 import type {
   AgentName,
   AuditRead,
+  ForcedPaymentReason,
   PlaygroundChannel,
   PlaygroundEscalation,
   PlaygroundMode,
@@ -153,6 +154,26 @@ const ESCALATION_REASON_LABEL: Record<string, string> = {
   max_attempts_exceeded: 'Stopping rule reached — max attempts/escalation stage',
 }
 
+const FAILURE_REASON_LABEL: Record<string, string> = {
+  wrong_otp: 'Incorrect OTP',
+  wrong_password: 'Wrong Login Credentials',
+  user_cancelled: 'Abandoned Before Completion',
+  insufficient_funds: 'Insufficient Balance',
+}
+
+const CHECKOUT_MISTAKE_OPTIONS: { reason: ForcedPaymentReason; label: string; icon: string }[] = [
+  { reason: 'success', label: 'Enter correct OTP & pay', icon: '✅' },
+  { reason: 'wrong_otp', label: 'Wrong OTP', icon: '❌' },
+  { reason: 'wrong_password', label: 'Wrong email/password', icon: '❌' },
+  { reason: 'user_cancelled', label: 'Press back before completing', icon: '⬅' },
+  { reason: 'insufficient_funds', label: 'Insufficient balance', icon: '💸' },
+]
+
+/** Matches a Razorpay-style rehearsal payment/mandate link inside a turn's text.
+ * Capturing group is load-bearing — `String.split` keeps captured delimiters in
+ * the result array, which is how `renderMessageText` below finds the link. */
+const LINK_PATTERN = /(https?:\/\/(?:rzp\.io|razorpay\.me)\/\S+)/g
+
 type TurnWithAudio = PlaygroundTurn & { audio_base64?: string }
 
 interface SpeechRecognitionResultItem {
@@ -218,6 +239,8 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
   const [speechSupported, setSpeechSupported] = useState(false)
   const [baseTrail, setBaseTrail] = useState<AuditRead[]>([])
   const [simulatedEvents, setSimulatedEvents] = useState<UnifiedAuditNode[]>([])
+  const [ticketStatus, setTicketStatus] = useState<'none' | 'ptp_human_review' | 'recovered'>('none')
+  const [phoneView, setPhoneView] = useState<'chat' | 'checkout'>('chat')
 
   const drawerRef = useRef<HTMLDivElement>(null)
   const audioRef = useRef<HTMLAudioElement | null>(null)
@@ -266,10 +289,6 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
     const day = simState ? simState.sim_day : 1
     const hour = simState ? simState.sim_hour : 9
     return recordTurnTimestamp(index, day, hour, (index * 7) % 60)
-  }
-
-  const logAction = (_label: string) => {
-    // Keep function signature for any remaining legacy callers
   }
 
   const logSimulatedEvent = (
@@ -437,6 +456,8 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
     setCallDuration(0)
     setIsListening(false)
     setSimulatedEvents([])
+    setTicketStatus('none')
+    setPhoneView('chat')
     actionSeqRef.current = 0
     finalSilenceLoggedRef.current = false
     autoPlayAbortRef.current = true
@@ -550,7 +571,12 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
     finalSilenceLoggedRef.current = false
     turnTimestampsRef.current.clear()
     try {
-      const res = await dataSource.startPlayground(eventId, mode)
+      // Simulate always opens on WhatsApp — the embedded checkout, clickable
+      // links, and reworked Controls & Actions panel are all built for the
+      // message rail; root-cause-based auto-pick (`pick_channel`) would
+      // otherwise land call-mapped cases (insufficient_funds, card_declined,
+      // etc.) on the voice-call screen with none of that available.
+      const res = await dataSource.startPlayground(eventId, mode, 'message')
       setChannel(res.channel)
       setTicketRef(res.ticket_ref)
       setPersona(res.persona)
@@ -561,9 +587,6 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
       setOutcome(res.outcome)
       setSimState(res.sim_state ?? null)
       setPhase('live')
-      logAction(
-        `${res.channel === 'call' ? 'Call connected' : 'WhatsApp chat opened'} with ${res.persona.name}`,
-      )
       logSimulatedEvent(
         'simulation',
         'simulation_started',
@@ -585,15 +608,19 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
   ) => {
     if (next !== outcome) {
       if (next === 'ptp_promised') {
-        logAction('Promise to Pay recorded — payment link generated & sent')
         logSimulatedEvent(
           'customer',
           'customer_promised_to_pay',
           'Customer committed to settlement date; payment link generated & sent',
           { promisedDate: simState ? `Day ${simState.sim_day + 2}` : 'Upcoming cycle' },
         )
+        setTicketStatus('ptp_human_review')
+        logSimulatedEvent(
+          'triage',
+          'ticket_opened_ptp',
+          'Simulated ticket opened (reason: promise-to-pay) — case routed to human review queue until payment settles',
+        )
       } else if (next === 'escalated') {
-        logAction('Escalated to human review (/attention)')
         logSimulatedEvent(
           'triage',
           'escalation_triggered',
@@ -602,14 +629,18 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
           nextEscalation ? { reason: nextEscalation.reason, summary: nextEscalation.conversation_summary } : undefined,
         )
       } else if (next === 'halted') {
-        logAction('Halted — security / risk check triggered')
         logSimulatedEvent(
           'recovery',
           'halted_stopping_rule',
           `Safety rule triggered: ${why}`,
         )
-      } else if (next === 'resolved') {
-        logAction('Payment verified — case marked resolved')
+      } else if (next === 'resolved' && ticketStatus === 'ptp_human_review') {
+        setTicketStatus('recovered')
+        logSimulatedEvent(
+          'triage',
+          'ticket_closed_recovered',
+          'Customer completed payment — simulated ticket closed and removed from human review queue',
+        )
       }
     }
     setOutcome(next)
@@ -625,7 +656,6 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
     const current = simState?.controlled_by[role]
     if (current) {
       const goingHuman = current !== 'human'
-      logAction(`${goingHuman ? 'Human took over as' : 'AI resumed control as'} ${role}`)
       logSimulatedEvent(
         'simulation',
         'channel_switched',
@@ -645,7 +675,28 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
 
   const isHumanCustomer = simState?.controlled_by.customer === 'human'
 
-  const handleCompletePayment = async () => {
+  // Renders a turn's text with any payment/mandate link as a clickable inline
+  // button that opens the embedded fake-checkout screen instead of dead text.
+  const renderMessageText = (text: string): React.ReactNode => {
+    const parts = text.split(LINK_PATTERN)
+    if (parts.length === 1) return text
+    return parts.map((part, i) =>
+      i % 2 === 1 ? (
+        <button
+          key={i}
+          type="button"
+          onClick={() => setPhoneView('checkout')}
+          className="text-sky-300 underline underline-offset-2 hover:text-sky-200 cursor-pointer break-all"
+        >
+          {part}
+        </button>
+      ) : (
+        <React.Fragment key={i}>{part}</React.Fragment>
+      ),
+    )
+  }
+
+  const handleCompletePayment = async (forcedReason?: ForcedPaymentReason) => {
     if (busy) return
     setBusy(true)
     setError(null)
@@ -672,15 +723,11 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
         history,
         channel,
         simState ?? undefined,
+        forcedReason,
       )
       recordTurnTimestamp(prevLen, currentDay, currentHour, 8)
       setHistory(res.history)
       playTurnVoice(res.turn as TurnWithAudio, res.history.length - 1)
-      logAction(
-        res.captured
-          ? `Payment link clicked → captured ✓ (${res.payment_id ?? 'txn'})`
-          : `Payment attempt failed: ${res.reason ?? 'unknown reason'}`,
-      )
       if (res.captured) {
         logSimulatedEvent(
           'recovery',
@@ -692,12 +739,12 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
         logSimulatedEvent(
           'recovery',
           'payment_capture_failed',
-          `Payment capture attempt failed: ${res.reason ?? 'declined by issuing bank'}.`,
-          { status: 'failed' },
+          `Payment capture attempt failed: ${FAILURE_REASON_LABEL[res.reason ?? ''] ?? res.reason ?? 'declined by issuing bank'}.`,
+          { status: 'failed', reason: res.reason },
         )
       }
-      setOutcome('resolved')
-      setReasoning(res.reasoning)
+      setPhoneView('chat')
+      applyOutcome(res.outcome, res.reasoning, res.sim_state, res.escalation)
       if (res.sim_state) setSimState(res.sim_state)
       setPhase('ended')
     } catch (err) {
@@ -765,7 +812,6 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
         recordTurnTimestamp(prevLen, currentDay, currentHour, 7)
         setHistory(res.history)
         if (res.sim_state) setSimState(res.sim_state)
-        logAction('Customer did not respond this turn (simulated silence)')
 
         const nextDay = res.sim_state?.sim_day ?? (currentDay + 1)
         const attemptsSoFar = res.sim_state?.attempts_so_far ?? 0
@@ -849,7 +895,6 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
           st = res.sim_state ?? st
           setHistory(res.history)
           if (res.sim_state) setSimState(res.sim_state)
-          logAction('Customer did not respond this turn (simulated silence)')
 
           const nextDay = st?.sim_day ?? (currentDay + 1)
           const attemptsSoFar = st?.attempts_so_far ?? 0
@@ -1299,6 +1344,66 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
                         <span className="text-[9px] text-slate-400 bg-slate-800 px-2 py-0.5 rounded">WhatsApp</span>
                       </div>
 
+                      {phoneView === 'checkout' ? (
+                        /* Embedded fake-checkout screen — swaps in for the WhatsApp body when a
+                           payment/mandate link is clicked. Never leaves the phone mockup, never
+                           writes to the real store (dataSource.simulatePlaygroundPayment stays
+                           sandboxed). */
+                        <div className="flex-1 flex flex-col bg-[#0b141a] overflow-y-auto">
+                          <div className="p-3 border-b border-[#2a3942] flex items-center gap-2 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => setPhoneView('chat')}
+                              disabled={busy}
+                              className="text-[11px] text-slate-300 hover:text-white flex items-center gap-1 cursor-pointer disabled:opacity-40"
+                            >
+                              <span>&lsaquo;</span>
+                              <span>Back to WhatsApp</span>
+                            </button>
+                          </div>
+                          <div className="p-4 flex-1 flex flex-col gap-4">
+                            <div className="rounded-xl bg-[#111b21] border border-[#2a3942] p-3.5">
+                              <div className="text-[10px] uppercase tracking-widest text-slate-400 font-semibold mb-1">
+                                Razorpay &middot; Test Mode
+                              </div>
+                              <div className="text-xs text-slate-300 flex items-center justify-between">
+                                <span>Billed to</span>
+                                <span className="text-slate-100">{persona.name}</span>
+                              </div>
+                              <div className="text-xs text-slate-300 flex items-center justify-between mt-1">
+                                <span>Amount due</span>
+                                <span className="text-white font-bold text-sm">{formatINR(persona.amount)}</span>
+                              </div>
+                            </div>
+
+                            <div className="text-[11px] text-slate-400">
+                              Choose how this checkout attempt goes:
+                            </div>
+                            <div className="flex flex-col gap-1.5">
+                              {CHECKOUT_MISTAKE_OPTIONS.map((opt) => (
+                                <button
+                                  key={opt.reason}
+                                  type="button"
+                                  disabled={busy}
+                                  onClick={() => handleCompletePayment(opt.reason)}
+                                  className={`p-2.5 rounded-xl text-left text-xs font-medium border transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-2 ${
+                                    opt.reason === 'success'
+                                      ? 'bg-emerald-950/50 border-emerald-500/50 text-emerald-200 hover:bg-emerald-900/60'
+                                      : 'bg-white/[0.03] border-white/10 text-slate-200 hover:bg-white/[0.07]'
+                                  }`}
+                                >
+                                  <span>{opt.icon}</span>
+                                  <span>{opt.label}</span>
+                                </button>
+                              ))}
+                            </div>
+                            <p className="text-[10px] text-slate-500 text-center mt-auto">
+                              Test mode — no real money moves. Razorpay-style checkout simulation.
+                            </p>
+                          </div>
+                        </div>
+                      ) : (
+                      <>
                       {/* WhatsApp Messages Body */}
                       <div className="flex-1 p-3 overflow-y-auto flex flex-col gap-2.5 min-h-0">
                         <div className="self-center px-2.5 py-1 rounded-md bg-[#182229] border border-[#222e35] text-[9px] text-[#ffd279] text-center max-w-[260px] shadow-sm">
@@ -1326,7 +1431,7 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
                               <div className="text-[10px] font-semibold text-emerald-400 mb-0.5">
                                 {isAgent ? 'Razorpay Support' : persona.name}
                               </div>
-                              <p className="text-xs leading-relaxed">{cleanTurnText(turn.text)}</p>
+                              <p className="text-xs leading-relaxed">{renderMessageText(cleanTurnText(turn.text))}</p>
                               <div className="mt-1 flex items-center justify-end gap-1.5 text-[10px] font-mono font-medium text-slate-300">
                                 <span>{turnTimestamp(i)}</span>
                                 {!isAgent && <span className="text-sky-400 font-bold">&#10003;&#10003;</span>}
@@ -1366,7 +1471,7 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
                               </span>
                               {outcome === 'ptp_promised' ? (
                                 <button
-                                  onClick={handleCompletePayment}
+                                  onClick={() => setPhoneView('checkout')}
                                   disabled={busy}
                                   className="text-[11px] bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold px-2.5 py-1 rounded shadow cursor-pointer transition-colors"
                                 >
@@ -1424,6 +1529,8 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
                           </svg>
                         </button>
                       </form>
+                      </>
+                      )}
                     </div>
                   )}
 
@@ -1466,186 +1573,77 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
                   )}
                 </div>
 
+                {/* Ticket status banner — PTP hand-off to a simulated human-review queue */}
+                {ticketStatus !== 'none' && (
+                  <div
+                    className={`p-3 rounded-xl liquid-glass-card border text-xs flex items-center gap-2 ${
+                      ticketStatus === 'ptp_human_review' ? 'border-amber-500/40' : 'border-emerald-500/40'
+                    }`}
+                  >
+                    <span className={`w-2 h-2 rounded-full ${ticketStatus === 'ptp_human_review' ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'}`} />
+                    <span className="font-semibold text-white">
+                      {ticketStatus === 'ptp_human_review'
+                        ? 'Simulated Ticket: PTP — Routed to Human Review'
+                        : 'Simulated Ticket: Recovered — Removed from Human Review'}
+                    </span>
+                  </div>
+                )}
+
                 {/* AI Simulation Controls (if AI vs AI mode) */}
                 {isAiMode && !isHumanCustomer ? (
-                  <div className="p-3.5 rounded-2xl liquid-glass-card flex flex-col gap-2.5">
-                    <div className="text-[11px] font-bold uppercase tracking-wider text-purple-300 flex items-center justify-between">
+                  <div className="p-3.5 rounded-2xl liquid-glass-card flex flex-col gap-1.5">
+                    <div className="text-[11px] font-bold uppercase tracking-wider text-purple-300 flex items-center justify-between mb-1">
                       <span>AI Simulation Engine</span>
                       <span className="text-[10px] font-mono text-slate-400">Two AI Agents</span>
                     </div>
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={advance}
-                        disabled={busy || outcome !== 'ongoing'}
-                        className="flex-1 py-2.5 px-3 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white font-semibold text-xs transition-all shadow-md flex items-center justify-center gap-2 cursor-pointer"
-                      >
-                        <span>▶</span>
-                        <span>{busy ? 'Simulating...' : 'Next Turn'}</span>
-                      </button>
-                      <button
-                        onClick={playToResolution}
-                        disabled={busy || outcome !== 'ongoing'}
-                        className="py-2.5 px-3 rounded-xl bg-purple-900/60 hover:bg-purple-800/60 border border-purple-500/40 disabled:opacity-40 text-purple-200 font-semibold text-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer"
-                      >
-                        <span>⚡</span>
-                        <span>Auto-Run</span>
-                      </button>
-                    </div>
-
-                    <div className="flex flex-col gap-1.5 mt-0.5">
-                      <button
-                        type="button"
-                        onClick={() => send('I want to talk to a human supervisor right now.')}
-                        disabled={busy || outcome !== 'ongoing'}
-                        className="py-2 px-3 rounded-lg bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/40 text-rose-300 text-xs font-medium transition-colors text-left flex items-center justify-between cursor-pointer disabled:opacity-40"
-                      >
-                        <span>🚨 Force Human Escalation</span>
-                        <span className="text-[10px] opacity-75">Test Handoff</span>
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => send('Can you give me a 50% discount code?')}
-                        disabled={busy || outcome !== 'ongoing'}
-                        className="py-2 px-3 rounded-lg bg-amber-950/40 hover:bg-amber-900/50 border border-amber-500/40 text-amber-300 text-xs font-medium transition-colors text-left flex items-center justify-between cursor-pointer disabled:opacity-40"
-                      >
-                        <span>⚠️ Out-of-Scope Query</span>
-                        <span className="text-[10px] opacity-75">Test Guardrail</span>
-                      </button>
-                    </div>
-                  </div>
-                ) : null}
-
-                {/* Interactive Customer Actions */}
-                <div className="p-3.5 rounded-2xl liquid-glass-card flex flex-col gap-2">
-                  <div className="text-[11px] font-bold uppercase tracking-wider text-slate-300">
-                    Simulate Customer Actions
-                  </div>
-                  <div className="flex flex-col gap-2">
+                    <button
+                      onClick={advance}
+                      disabled={busy || outcome !== 'ongoing' || ticketStatus === 'ptp_human_review'}
+                      className="w-full py-2.5 px-3 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white font-semibold text-xs transition-all shadow-md flex items-center justify-center gap-2 cursor-pointer"
+                    >
+                      <span>▶</span>
+                      <span>{busy ? 'Simulating...' : 'Next Turn'}</span>
+                    </button>
+                    <button
+                      onClick={playToResolution}
+                      disabled={busy || outcome !== 'ongoing' || ticketStatus === 'ptp_human_review'}
+                      className="w-full py-2.5 px-3 rounded-xl bg-purple-900/60 hover:bg-purple-800/60 border border-purple-500/40 disabled:opacity-40 text-purple-200 font-semibold text-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer"
+                    >
+                      <span>⚡</span>
+                      <span>Auto-Run</span>
+                    </button>
                     <button
                       type="button"
-                      onClick={handleCompletePayment}
-                      disabled={busy || outcome !== 'ongoing'}
-                      className="p-2.5 rounded-xl bg-emerald-950/50 hover:bg-emerald-900/60 border border-emerald-500/50 text-left transition-all cursor-pointer disabled:opacity-50"
+                      onClick={() => send('Can you give me a 50% discount code?')}
+                      disabled={busy || outcome !== 'ongoing' || ticketStatus === 'ptp_human_review'}
+                      className="w-full py-2 px-3 rounded-lg bg-amber-950/40 hover:bg-amber-900/50 border border-amber-500/40 text-amber-300 text-xs font-medium transition-colors text-left flex items-center justify-between cursor-pointer disabled:opacity-40"
                     >
-                      <div className="text-xs font-bold text-emerald-300 flex items-center gap-1.5">
-                        <span>💳</span>
-                        <span>Click Link &amp; Pay (Webhook)</span>
-                      </div>
-                      <div className="text-[10px] text-slate-300 mt-0.5">
-                        Simulates payment capture &amp; verified resolution.
-                      </div>
+                      <span>⚠️ Out-of-Scope Query</span>
+                      <span className="text-[10px] opacity-75">Test Guardrail</span>
                     </button>
-
+                    <button
+                      type="button"
+                      onClick={() => send('I want to talk to a human supervisor right now.')}
+                      disabled={busy || outcome !== 'ongoing' || ticketStatus === 'ptp_human_review'}
+                      className="w-full py-2 px-3 rounded-lg bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/40 text-rose-300 text-xs font-medium transition-colors text-left flex items-center justify-between cursor-pointer disabled:opacity-40"
+                    >
+                      <span>🚨 Force Human Escalation</span>
+                      <span className="text-[10px] opacity-75">Test Handoff</span>
+                    </button>
                     <button
                       type="button"
                       onClick={() => {
                         interruptSpeech()
-                        logAction('Customer action: Promised to pay on salary credit date (10th)')
                         send('Haan main pakka 10th ko salary credit aane par pay kar dunga, please abhi remind mat karna.')
                       }}
-                      disabled={busy || outcome !== 'ongoing'}
-                      className="p-2.5 rounded-xl bg-amber-950/50 hover:bg-amber-900/60 border border-amber-500/50 text-left transition-all cursor-pointer disabled:opacity-50"
+                      disabled={busy || outcome !== 'ongoing' || ticketStatus === 'ptp_human_review'}
+                      className="w-full py-2 px-3 rounded-lg bg-emerald-950/40 hover:bg-emerald-900/50 border border-emerald-500/40 text-emerald-300 text-xs font-medium transition-colors text-left flex items-center justify-between cursor-pointer disabled:opacity-40"
                     >
-                      <div className="text-xs font-bold text-amber-300 flex items-center gap-1.5">
-                        <span>🤝</span>
-                        <span>Record Promise to Pay (PTP)</span>
-                      </div>
-                      <div className="text-[10px] text-slate-300 mt-0.5">
-                        Sets 24h cooldown &amp; 3 auto-reminders.
-                      </div>
-                    </button>
-
-                    <button
-                      type="button"
-                      onClick={() => {
-                        interruptSpeech()
-                        logAction('Customer action: Requested alternate payment method')
-                        send('Mere card se issue aa raha hai, kya aap mujhe fresh UPI payment link bhej sakte ho?')
-                      }}
-                      disabled={busy || outcome !== 'ongoing'}
-                      className="p-2.5 rounded-xl bg-indigo-950/50 hover:bg-indigo-900/60 border border-indigo-500/50 text-left transition-all cursor-pointer disabled:opacity-50"
-                    >
-                      <div className="text-xs font-bold text-indigo-300 flex items-center gap-1.5">
-                        <span>🔄</span>
-                        <span>Retry Alternate Method (UPI)</span>
-                      </div>
-                      <div className="text-[10px] text-slate-300 mt-0.5">
-                        Tests fallback rail generation.
-                      </div>
+                      <span>🤝 Record Promise to Pay (PTP)</span>
+                      <span className="text-[10px] opacity-75">Routes to Human Review</span>
                     </button>
                   </div>
-                </div>
-
-                {/* Customer Input & Quick Response (Always available for tester) */}
-                <div className="p-3.5 rounded-2xl liquid-glass-card flex flex-col gap-2">
-                  <div className="flex items-center justify-between">
-                    <div className="text-[11px] font-bold uppercase tracking-wider text-purple-300 flex items-center gap-1.5">
-                      <span>💬 Tester Input</span>
-                      <span className="text-[10px] text-slate-400 font-normal">(Prompt Agent)</span>
-                    </div>
-                  </div>
-                  <div className="text-[10px] text-slate-400">
-                    Input whatever you want to test how the recovery agent handles questions or objections:
-                  </div>
-                  <div className="flex flex-wrap gap-1">
-                    {[
-                      'Kyu fail hua tha?',
-                      'Haan payment link bhej do',
-                      'Main baad mein pay karunga',
-                      'Mujhe discount chahiye',
-                      'Supervisor se baat karao',
-                    ].map((chip) => (
-                      <button
-                        key={chip}
-                        onClick={() => {
-                          interruptSpeech()
-                          send(chip)
-                        }}
-                        disabled={busy || outcome !== 'ongoing'}
-                        className="px-2 py-1 rounded-lg liquid-glass-pill text-[11px] text-slate-200 hover:bg-white/10 cursor-pointer disabled:opacity-50"
-                      >
-                        {chip}
-                      </button>
-                    ))}
-                  </div>
-
-                  <form
-                    onSubmit={(e) => {
-                      e.preventDefault()
-                      send()
-                    }}
-                    className="flex items-end gap-1.5 mt-1"
-                  >
-                    <textarea
-                      value={input}
-                      onChange={(e) => setInput(e.target.value)}
-                      rows={2}
-                      placeholder="Type whatever you want to input to the agent..."
-                      disabled={busy || outcome !== 'ongoing'}
-                      className="flex-1 px-2.5 py-1.5 rounded-xl liquid-glass-card text-white text-xs focus:outline-none resize-none placeholder-slate-400"
-                    />
-                    {speechSupported && (
-                      <button
-                        type="button"
-                        onClick={isListening ? stopListening : startListening}
-                        disabled={busy || outcome !== 'ongoing'}
-                        className={`p-2 rounded-xl text-xs font-bold transition-colors cursor-pointer shrink-0 ${
-                          isListening ? 'bg-red-500/80 text-white animate-pulse' : 'bg-slate-850 text-slate-300 hover:bg-slate-700'
-                        }`}
-                        title={isListening ? 'Stop recording' : 'Speak customer reply'}
-                      >
-                        🎤
-                      </button>
-                    )}
-                    <button
-                      type="submit"
-                      disabled={busy || !input.trim() || outcome !== 'ongoing'}
-                      className="px-3 py-2 rounded-xl text-xs font-bold text-white bg-indigo-600 hover:bg-indigo-500 disabled:opacity-50 cursor-pointer shrink-0"
-                    >
-                      Send
-                    </button>
-                  </form>
-                </div>
+                ) : null}
 
                 {phase === 'ended' && (
                   <button

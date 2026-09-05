@@ -1,6 +1,12 @@
 # AGENTS_CONTRACT.md — frozen cross-agent contract
 
-Last updated: 2026-09-05 — owner amendment (Phase B0 plan-review): resolved
+Last updated: 2026-09-05 — simulation-engine amendment (S9): `click_payment_link`
+gained an optional `forced_reason` param for the tester-driven fake-checkout
+screen, a playground-only `wrong_password` failure reason, and an
+`insufficient_funds` carve-out (never escalates; reschedules
+`sim_state.salary_reminder_day` instead). See §12/§13.
+
+Previously (2026-09-05): owner amendment (Phase B0 plan-review): resolved
 payment-engine-builder's P5-P8 and simulation-engine-builder's S4-S7 contract
 questions from their plan-only pass — most notably **P5, a real bug catch**:
 `resolve_fake_capture` needed an `attempt` salt or a bounded `/pay/:token`
@@ -573,7 +579,10 @@ keeps working.
   "customer_response_probability": 0.7,    // adjusted +-0.15/-0.1 per day, clamped [0.1, 0.95]
   "outstanding_asks": [],                  // list[str], keyword-matched customer asks not yet addressed
   "last_reply_text": null,                 // string | null -- anti-repetition for the deterministic fallback
-  "capture_attempts": 0                    // bounded ~3 attempts at click_payment_link, mirrors /pay/:token
+  "capture_attempts": 0,                   // bounded ~3 attempts at click_payment_link, mirrors /pay/:token
+  "salary_reminder_day": 0                 // 0 = not scheduled; set to sim_day+5 on an insufficient_funds
+                                            // capture failure (sandbox analogue of recovery.SALARY_WINDOW_DAY,
+                                            // since sim_day is a relative counter, not a calendar date) (S9)
 }
 ```
 
@@ -585,7 +594,7 @@ in the Phase B0 plan but the `sim_state` shape above and the
 def start_session(event, *, mode, channel=None, settings=None) -> dict: ...
 def send_message(event, history, message, channel, *, speaker=None, sim_state=None, settings=None) -> dict: ...
 def advance_conversation(event, history, channel, *, sim_state=None, settings=None) -> dict: ...
-def click_payment_link(event, history, channel="call", *, sim_state=None, settings=None) -> dict:
+def click_payment_link(event, history, channel="call", *, sim_state=None, settings=None, forced_reason=None) -> dict:
     """Renamed from simulate_payment. A deprecated `simulate_payment` alias
     may be kept (S5 -- see routes.py migration note below). Calls
     payment.resolve_fake_capture(event, link_id, settings=settings,
@@ -599,7 +608,21 @@ def click_payment_link(event, history, channel="call", *, sim_state=None, settin
     never collides since this module never writes anywhere). Increments
     sim_state["capture_attempts"]. MUST NEVER call payment.apply_capture
     (that writes to the DB and would break the sandboxing guarantee) --
-    test_playground.py asserts zero calls to it via a spy/mock."""
+    test_playground.py asserts zero calls to it via a spy/mock.
+
+    Optional `forced_reason: str | None = None` (S9): lets a tester-driven
+    fake-checkout screen pick the outcome explicitly ("success" | "wrong_otp"
+    | "wrong_password" | "user_cancelled" | "insufficient_funds") instead of
+    the random weighted roll. `forced_reason=None` (default) is byte-for-byte
+    the behavior above. When set, `resolve_fake_capture` is skipped entirely
+    and a CaptureResult-shaped dict is built locally with the same
+    paise-rounding convention. `wrong_password` is playground-only -- never
+    added to payment.py's CaptureResult reason vocabulary, since that
+    module's contract is frozen and shared with the real DB-writing
+    `/pay/:token` flow. `insufficient_funds` (forced or rolled) never
+    escalates regardless of attempt count -- it instead sets
+    `sim_state["salary_reminder_day"] = sim_day + 5` and keeps outcome
+    "ongoing"."""
 ```
 
 **Escalation object** (`outcome="escalated"` responses):
@@ -692,3 +715,4 @@ merge, not for an exact list match.
 | S5 | `routes.py` still calls `simulate_payment` with legacy `"interactive"\|"auto"` mode strings — coordinate a `routes.py` change now, or alias? | Alias approved: keep a deprecated `simulate_payment = click_payment_link` and accept legacy mode strings (mapped internally to `"custom"\|"ai"`) so Phase B needs zero `routes.py` coordination. Team-lead migrates `routes.py` to the new names in Phase C's API-integration pass, then drops the alias in the same change. |
 | S6 | When a human takes over as the Resolver, how is the conversation outcome declared? | An explicit optional `outcome` param on `send_message` when `speaker="agent"`, trusted as-supplied, never inferred from the human's freeform text — inferring intent from arbitrary human phrasing is unreliable. |
 | S7 | Is `_DEFERRAL_PATTERNS` (e.g. "kal", "tomorrow") part of the frozen contract? | No — same latitude as the `outstanding_asks` keyword map (S1): the builder defines it freely; team-lead reviews for reasonable coverage at merge, not an exact-list match. |
+| S9 | Embedded fake-checkout screen needs a tester-forced payment outcome (success/wrong OTP/wrong password/cancelled/insufficient funds) instead of a random roll — how, without breaking S2's pure/stateless guarantee or payment.py's frozen `CaptureResult` vocabulary? | Added `click_payment_link(..., forced_reason: str | None = None)` — no new param on `payment.resolve_fake_capture`, no `session` anywhere. `forced_reason=None` (default) is unchanged; when set, `resolve_fake_capture` is skipped and a `CaptureResult`-shaped dict is built locally in `playground.py` with the same `_q`/`MONEY` paise-rounding convention. `wrong_password` is a playground-only reason (login/credentials failure before the OTP step) — deliberately **not** added to `payment.py`, since that module's `CaptureResult` vocabulary (`captured`/`insufficient_funds`/`wrong_otp`/`user_cancelled`) is frozen and shared with the real DB-writing `/pay/:token` flow; a fifth reason there would ripple into `apply_capture`'s payload shape and the real webhook path for no real-flow benefit. Also carved out: `insufficient_funds` (forced or randomly rolled) never escalates on attempt-count, unlike every other failure reason — it schedules `sim_state["salary_reminder_day"] = sim_day + 5` instead and stays "ongoing". `sim_day` is only a relative rehearsal counter, not a calendar date, so `+5` is a bounded, deterministic sandbox approximation of `recovery.SALARY_WINDOW_DAY`, not a claim of calendar accuracy. |

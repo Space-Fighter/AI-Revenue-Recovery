@@ -8,9 +8,18 @@ Diagrams and design rationale. Companion to
 > the same change that alters the architecture, data model, agent flow, or
 > runtime topology.
 
-Last updated: 2026-09-05 — **Systemized Unified Audit Log & Customer Action Trail** (plan.md §15):
+Last updated: 2026-09-05 — **Simulate tab Controls & Actions rework** (plan.md §9,
+Simulate/Playground UI): see §6.2's new sequence diagram — tester-picked
+checkout mistakes via `forced_reason` on `playground.click_payment_link`
+(AGENTS_CONTRACT.md §12/§13 S9), the salary-day reschedule for
+`insufficient_funds`, and the PTP → simulated-human-review → recovered
+`ticketStatus` hand-off in `SimulateSession.tsx`. `payment.py`'s frozen
+`CaptureResult` contract and the real `/pay/:token` DB-writing flow are
+untouched.
+<!-- previous update: Systemized Unified Audit Log & Customer Action Trail -->
+
+Previously (2026-09-05) — **Systemized Unified Audit Log & Customer Action Trail** (plan.md §15):
 Unified the AI pipeline decision trail and simulation event logs into one standardized, systemized, color-coded audit log component (`frontend/src/components/AuditTimeline.tsx`). Customer actions (link clicks, OTP entries, customer replies, calls answered, silence) elevated to first-class audit events; strict chronological sorting merges store records and live simulation events via a monotonic `sortKey`; 7 semantic color-coded categories with interactive filter pills; specialized inline cards for Payment Links, Mandate Renewals, and verified Payment Captures. Deployed across `TicketDrawer.tsx`, `DetailDrawer.tsx`, and `SimulateSession.tsx` Column 2.
-<!-- previous update: Payment-capture integrity fix + Playground redesign -->
 
 Prior: 2026-09-04 — **Simulate / Playground + Sarvam TTS fix + synthetic
 contact data**: `app/agents/playground.py` (stateless sandboxed rehearsal agent,
@@ -507,6 +516,51 @@ wrong_otp/insufficient_funds/user_cancelled/success) but **never**
 "never writes to the store" guarantee true even though the module now shares
 code with the money-moving payment engine.
 
+**2026-09-05 (Controls & Actions rework) — tester-picked checkout + PTP hand-off:**
+
+```mermaid
+sequenceDiagram
+    actor T as Tester
+    participant UI as SimulateSession.tsx
+    participant API as FastAPI
+    participant PG as playground.py
+
+    Note over T,UI: Any turn's text contains a rzp.io/razorpay.me link
+    T->>UI: click the link (renderMessageText)
+    UI->>UI: setPhoneView('checkout') — swaps WhatsApp body for embedded checkout, no API call
+    alt Tester backs out
+        T->>UI: click "‹ Back to WhatsApp"
+        UI->>UI: setPhoneView('chat') — no API call, no state change
+    else Tester picks a mistake to simulate
+        T->>UI: pick one of success / wrong_otp / wrong_password / user_cancelled / insufficient_funds
+        UI->>API: POST /playground/pay {history, channel, sim_state, forced_reason}
+        API->>PG: click_payment_link(event, history, channel, sim_state, forced_reason)
+        alt forced_reason == "insufficient_funds"
+            PG->>PG: sim_state.salary_reminder_day = sim_day + 5; _advance_day(st)
+            PG-->>API: {outcome: "ongoing", turn: "...reminder on Day N", ...}
+        else other forced_reason
+            PG-->>API: {captured, reason, turn: cause + how-to-fix, outcome}
+        end
+        API-->>UI: result
+        UI->>UI: setPhoneView('chat'); applyOutcome(...)
+    end
+
+    Note over T,UI: Promise-to-Pay hand-off
+    T->>UI: click "Record Promise to Pay (PTP)"
+    UI->>API: POST /playground/message (canned PTP commitment line)
+    API-->>UI: outcome = ptp_promised
+    UI->>UI: applyOutcome sets ticketStatus='ptp_human_review'; AI-engine buttons disable;<br/>logs ticket_opened_ptp
+    Note over T,UI: Later — customer completes payment via the checkout flow above
+    UI->>UI: applyOutcome sees outcome='resolved' while ticketStatus='ptp_human_review'<br/>→ ticketStatus='recovered'; logs ticket_closed_recovered
+```
+
+`forced_reason` is playground-only state — it never reaches `payment.py`'s
+frozen `CaptureResult` vocabulary (`wrong_password` has no equivalent in the
+real `/pay/:token` flow). `ticketStatus` is UI-only React state, not a real
+`tickets` row — the module's "never writes to the store" guarantee (above)
+still holds; this is a rehearsal of what a real triage hand-off *would* look
+like, not one.
+
 ---
 
 ## 7. Component responsibilities
@@ -530,7 +584,7 @@ code with the money-moving payment engine.
 | Pipeline | `app/pipeline.py` ✅ | chains agents 3–6 into one run; returns the MetricsBlock | argparse CLI + printed summary |
 | API | `app/main.py`, `app/api/*` ✅ | REST over store + pipeline (`/api/events`, `/api/events/{id}/audit`, `/api/metrics`, `/api/pipeline/run`) | CORS to frontend only |
 | Dashboard | `frontend/src/pages/*` ✅ (fixtures; live via `VITE_DATA_SOURCE`) | at-risk queue, decision trail, charts, exception list, fraud-cluster alert | mirrors Razorpay's plain-English tone |
-| Simulate / Playground UI | `frontend/src/components/SimulateSession.tsx` ✅ (rewritten 2026-09-05) | two-column live-session layout: phone-style chat/call mockup + a structured, timestamped Messaging/Call/Customer-Actions transcript-log panel; "Take over this simulation" + "View Transcripts" pairing; embeds `AuditTimeline` in Column 2 for a live unified decision & customer action stream | liquid-glass throughout; `sim_state` round-tripped exactly as returned; never writes to the store |
+| Simulate / Playground UI | `frontend/src/components/SimulateSession.tsx` ✅ (rewritten 2026-09-05, Controls & Actions reworked 2026-09-05) | 4-column live-session layout: transcripts, unified audit/event trail, phone-style chat/call mockup (with an embedded fake-checkout sub-view for clicked payment links), and a trimmed Controls & Actions panel (AI Simulation Engine stack + PTP → simulated human-review hand-off) | liquid-glass throughout; `sim_state` round-tripped exactly as returned; never writes to the store; `ticketStatus` is local UI state, never a real `tickets` row |
 | Unified Audit Log | `frontend/src/components/AuditTimeline.tsx` ✅ (revamped 2026-09-05) | single unified, systemized audit log engine across TicketDrawer, DetailDrawer, and SimulateSession: strict chronological sorting via monotonic sortKey; first-class Customer Actions (link clicks, OTP entries, customer replies, silence); 7 category color themes with interactive count-badged filter pills; specialized inline cards for Payment Links, Mandate Renewals, Payment Captures, and PTP commitments | unified presentation; strictly chronological; identical contract across DB-backed and rehearsal surfaces |
 | Payment checkout page | `frontend/src/pages/PayCheckout.tsx` ✅ (new 2026-09-05) | standalone `/pay/:token` page (no `AppShell` chrome) — OTP-entry simulation, bounded retry, terminal state past `MAX_ATTEMPTS` | the real customer-facing surface for the fake gateway; a real DB write via the backend's `/api/pay/{token}/attempt` |
 | Webhook listener | `app/webhooks/listener.py` ✅ | ingest Razorpay **test-mode** webhook deliveries as `detected` events | HMAC-SHA256 signature verified over the raw body; idempotent (dedup by event id); success/unknown events acknowledged but ignored; amounts paise→₹; no PII stored (emails/phones hashed) |
@@ -585,6 +639,10 @@ code with the money-moving payment engine.
 | `voice.py` prerecorded vs Simulate live (2026-09-04) | `app/agents/voice.py` is a **one-shot script** (one LLM call writes the entire dialogue up front, deterministic for a given case); `app/agents/playground.py` is **live, turn-by-turn** (two independently-prompted `chat_turns()` calls react to the real transcript so far) | the prerecorded transcript is correct for the dashboard "play back what the agent would say" UX — always the same, deterministic. Simulate is for a judge who wants to actually interact and see how the AI responds. Mixing the two models would break both use cases |
 | Simulate sandboxing guarantee (2026-09-04) | `app/agents/playground.py` never calls `insert_ticket`, `update_event`, or `log_action`; the history list lives in the browser (resent each call); the backend is stateless per session | a judge playing "yes I'll pay" must never move the real `events`/`tickets` tables or the batch's `MetricsBlock`. Verified in `test_playground.py` with DB row-count before/after snapshots AND in `test_api.py` at the HTTP level |
 | Synthetic customer contact data (2026-09-04) | `customer_name`, `customer_phone`, `customer_bank_account`, `customer_upi_vpa` added to `Event` / `EventCreate` / `EventRead`; generated via `_fake_contact()` in `generate.py` using Faker | Razorpay's test-mode docs have no customer/contact simulator (verified against the test-card/UPI docs); these fields exist so a case reads like a real record and the Playground has a persona to role-play against. Phone/bank-account shown **masked** in `DetailDrawer`. Never real PII |
+| Tester-picked checkout outcome, not a random roll (2026-09-05) | `click_payment_link(..., forced_reason=...)` builds the `CaptureResult` locally instead of calling `payment.resolve_fake_capture` when the tester explicitly picks a mistake at the embedded checkout screen; `forced_reason=None` (every other caller) keeps the original random-roll path byte-for-byte | a rehearsal is for **demonstrating** each recovery path on demand (wrong OTP vs. wrong password vs. insufficient funds), not for hoping a random roll lands on the one you want to show a judge; keeping it opt-in preserves the existing weighted-random behavior for every other caller |
+| `wrong_password` stays playground-only (2026-09-05) | added to `playground.py`'s local failure-copy map, never to `payment.py`'s `CaptureResult` reason vocabulary | `payment.py` is frozen and shared with the real, DB-writing `/pay/:token` flow (`AGENTS_CONTRACT.md` §11) — extending its contract for a sandbox-only distinction would ripple into `PayCheckout.tsx` and the real webhook-capture path for no real-flow benefit |
+| `salary_reminder_day` is a relative-day approximation, not a calendar date (2026-09-05) | `sim_state.salary_reminder_day = sim_day + 5` on an `insufficient_funds` checkout failure; never escalates | the real pipeline's `recovery.SALARY_WINDOW_DAY` targets a calendar day-of-month; the Playground's `sim_day` is only a relative turn counter with no calendar backing, so a bounded fixed offset is the honest sandbox equivalent — documented as an approximation rather than silently reusing the real constant's semantics |
+| PTP → simulated human review is UI state, not a ticket write (2026-09-05) | `SimulateSession.tsx`'s `ticketStatus` (`'none'\|'ptp_human_review'\|'recovered'`) drives a banner and disables the AI Simulation Engine buttons while "with a human"; clears to `'recovered'` when a later checkout succeeds | rehearses what a real triage hand-off *feels like* (case parked, only the payment-link path stays live, then closes out on payment) without touching the real `tickets` table — consistent with `playground.py` never calling `insert_ticket`/`update_event`/`log_action` |
 
 ---
 
