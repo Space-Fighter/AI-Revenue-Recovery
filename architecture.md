@@ -8,17 +8,26 @@ Diagrams and design rationale. Companion to
 > the same change that alters the architecture, data model, agent flow, or
 > runtime topology.
 
-Last updated: 2026-09-05 — **Simulate tab Controls & Actions rework** (plan.md §9,
-Simulate/Playground UI): see §6.2's new sequence diagram — tester-picked
-checkout mistakes via `forced_reason` on `playground.click_payment_link`
-(AGENTS_CONTRACT.md §12/§13 S9), the salary-day reschedule for
-`insufficient_funds`, and the PTP → simulated-human-review → recovered
-`ticketStatus` hand-off in `SimulateSession.tsx`. `payment.py`'s frozen
-`CaptureResult` contract and the real `/pay/:token` DB-writing flow are
-untouched.
-<!-- previous update: Systemized Unified Audit Log & Customer Action Trail -->
+Last updated: 2026-09-05 — **Simulate tab: PTP escalation bugfix + reminder
+cadence** (plan.md §9, `AGENTS_CONTRACT.md` §12/§13 S10): see §6.2's updated
+sequence diagram and §8's new decision rows — a real bug (a same-turn
+`ptp_promised`/`resolved` outcome was being silently clobbered into
+`"escalated"` by the generic attempts ceiling) is fixed, and a Promise-to-Pay
+is now its own state machine decoupled from the attempts ladder: it only
+escalates if it goes overdue or a post-PTP payment attempt fails, dates shown
+to the customer are real calendar strings (never `sim_day`), and a new
+reminder-cadence gate stops the same automated nudge from repeating same-day
+or forever.
+<!-- previous update: Simulate tab Controls & Actions rework -->
 
-Previously (2026-09-05) — **Systemized Unified Audit Log & Customer Action Trail** (plan.md §15):
+Previously (2026-09-05) — **Simulate tab Controls & Actions rework** (plan.md §9,
+Simulate/Playground UI): tester-picked checkout mistakes via `forced_reason` on
+`playground.click_payment_link` (AGENTS_CONTRACT.md §12/§13 S9), the
+salary-day reschedule for `insufficient_funds`, and a `ticketStatus` hand-off
+in `SimulateSession.tsx`. `payment.py`'s frozen `CaptureResult` contract and
+the real `/pay/:token` DB-writing flow are untouched.
+
+Prior (2026-09-05) — **Systemized Unified Audit Log & Customer Action Trail** (plan.md §15):
 Unified the AI pipeline decision trail and simulation event logs into one standardized, systemized, color-coded audit log component (`frontend/src/components/AuditTimeline.tsx`). Customer actions (link clicks, OTP entries, customer replies, calls answered, silence) elevated to first-class audit events; strict chronological sorting merges store records and live simulation events via a monotonic `sortKey`; 7 semantic color-coded categories with interactive filter pills; specialized inline cards for Payment Links, Mandate Renewals, and verified Payment Captures. Deployed across `TicketDrawer.tsx`, `DetailDrawer.tsx`, and `SimulateSession.tsx` Column 2.
 
 Prior: 2026-09-04 — **Simulate / Playground + Sarvam TTS fix + synthetic
@@ -545,21 +554,76 @@ sequenceDiagram
         UI->>UI: setPhoneView('chat'); applyOutcome(...)
     end
 
-    Note over T,UI: Promise-to-Pay hand-off
-    T->>UI: click "Record Promise to Pay (PTP)"
-    UI->>API: POST /playground/message (canned PTP commitment line)
-    API-->>UI: outcome = ptp_promised
-    UI->>UI: applyOutcome sets ticketStatus='ptp_human_review'; AI-engine buttons disable;<br/>logs ticket_opened_ptp
-    Note over T,UI: Later — customer completes payment via the checkout flow above
-    UI->>UI: applyOutcome sees outcome='resolved' while ticketStatus='ptp_human_review'<br/>→ ticketStatus='recovered'; logs ticket_closed_recovered
-```
-
 `forced_reason` is playground-only state — it never reaches `payment.py`'s
 frozen `CaptureResult` vocabulary (`wrong_password` has no equivalent in the
 real `/pay/:token` flow). `ticketStatus` is UI-only React state, not a real
 `tickets` row — the module's "never writes to the store" guarantee (above)
 still holds; this is a rehearsal of what a real triage hand-off *would* look
 like, not one.
+
+**2026-09-05 (S10) — Promise-to-Pay is its own state machine, decoupled from
+the attempts ladder.** The diagram above's original PTP hand-off was wrong: a
+`POST /playground/message` reply that had just become `outcome=ptp_promised`
+could be silently overridden into `"escalated"` in the *same response* purely
+because the generic attempts/escalation-stage ceiling had been crossed
+(`_resolve_escalation_reason` didn't look at what the outcome already was).
+Fixed and redesigned:
+
+```mermaid
+sequenceDiagram
+    actor T as Tester
+    participant UI as SimulateSession.tsx
+    participant API as FastAPI
+    participant PG as playground.py
+
+    T->>UI: click "Record Promise to Pay (PTP)" (or the customer just agrees)
+    UI->>API: POST /playground/message (canned PTP commitment line)
+    API->>PG: send_message(...) -> _apply_turn_state_machine
+    PG->>PG: outcome becomes "ptp_promised" -- attempts-ceiling check is skipped<br/>for this outcome (bugfix); _activate_ptp_if_needed sets<br/>ptp_active=true, ptp_target_day=sim_day+5, ptp_target_date_label="6th Sept"
+    PG-->>API: {outcome: "ptp_promised", sim_state: {ptp_active: true, ...}}
+    API-->>UI: result
+    UI->>UI: applyOutcome sets ticketStatus='ptp_pending' (NOT human_review);<br/>logs ptp_recorded; Next Turn/Auto-Run/chat input STAY enabled (isActionable)
+
+    Note over T,PG: While ptp_active, every subsequent turn suspends the normal<br/>attempts/escalation-stage ladder entirely -- more turns never auto-escalate
+
+    alt Tester keeps chatting / Next Turn / Auto-Run
+        T->>UI: advance the conversation
+        UI->>API: POST /playground/message or /advance
+        API->>PG: _apply_turn_state_machine (ptp_active branch)
+        alt sim_day >= ptp_target_day and still unpaid
+            PG-->>API: outcome="escalated", escalation.reason="ptp_overdue"; ptp_active=false
+        else explicit human request
+            PG-->>API: outcome="escalated", escalation.reason="customer_requested_human"
+        else still waiting
+            PG-->>API: outcome stays "ptp_promised" (no escalation, no new nudge sent)
+        end
+        API-->>UI: result
+        UI->>UI: applyOutcome: escalated -> ticketStatus='human_review' (logs ptp_broken);<br/>still ptp_promised -> no change
+    else Tester clicks the payment link (checkout flow above)
+        T->>UI: pick "success" or a failure reason at checkout
+        UI->>API: POST /playground/pay {..., forced_reason?}
+        API->>PG: click_payment_link(...)
+        alt captured
+            PG-->>API: outcome="resolved"; ptp_active=false (promise honored)
+        else capture fails while ptp_active
+            PG-->>API: outcome="escalated", escalation.reason="ptp_payment_failed"; ptp_active=false
+        end
+        API-->>UI: result
+        UI->>UI: applyOutcome: resolved -> ticketStatus='recovered' (logs ticket_closed_recovered);<br/>escalated -> ticketStatus='human_review' (logs ptp_broken)
+    end
+```
+
+**Reminder-cadence gate** (also S10, pre-PTP nudge ladder only — moot once
+`ptp_active`, since no automated nudges are sent during that wait): each
+reminder's ask is classified into a short tag (`_classify_reminder_cta`); the
+same tag repeating the same `sim_day` is suppressed (`send_message`/
+`advance_conversation` return `{"suppressed": true, "turn"/"agent_turn": None}`
+instead of a duplicate bubble — the frontend now checks for this and skips
+playback rather than crashing on a null turn) and the same tag persisting past
+3 distinct days escalates as `reminders_exhausted`; a genuinely different ask
+resets the cap. Dates shown to the customer are always real calendar strings
+(`_format_calendar_date`/`_ordinal`, e.g. "1st October") — `sim_day` stays an
+internal relative gating counter, never surfaced in customer-facing text.
 
 ---
 
@@ -584,7 +648,7 @@ like, not one.
 | Pipeline | `app/pipeline.py` ✅ | chains agents 3–6 into one run; returns the MetricsBlock | argparse CLI + printed summary |
 | API | `app/main.py`, `app/api/*` ✅ | REST over store + pipeline (`/api/events`, `/api/events/{id}/audit`, `/api/metrics`, `/api/pipeline/run`) | CORS to frontend only |
 | Dashboard | `frontend/src/pages/*` ✅ (fixtures; live via `VITE_DATA_SOURCE`) | at-risk queue, decision trail, charts, exception list, fraud-cluster alert | mirrors Razorpay's plain-English tone |
-| Simulate / Playground UI | `frontend/src/components/SimulateSession.tsx` ✅ (rewritten 2026-09-05, Controls & Actions reworked 2026-09-05) | 4-column live-session layout: transcripts, unified audit/event trail, phone-style chat/call mockup (with an embedded fake-checkout sub-view for clicked payment links), and a trimmed Controls & Actions panel (AI Simulation Engine stack + PTP → simulated human-review hand-off) | liquid-glass throughout; `sim_state` round-tripped exactly as returned; never writes to the store; `ticketStatus` is local UI state, never a real `tickets` row |
+| Simulate / Playground UI | `frontend/src/components/SimulateSession.tsx` ✅ (rewritten 2026-09-05, Controls & Actions reworked 2026-09-05, PTP/reminder bugfix S10 2026-09-05) | 4-column live-session layout: transcripts, unified audit/event trail, phone-style chat/call mockup (with an embedded fake-checkout sub-view for clicked payment links), and a trimmed Controls & Actions panel (AI Simulation Engine stack that stays live through a Promise-to-Pay wait, not just `ongoing`) | liquid-glass throughout; `sim_state` round-tripped exactly as returned; never writes to the store; `ticketStatus` (`'none'\|'ptp_pending'\|'human_review'\|'recovered'`) is local UI state, never a real `tickets` row; a PTP never auto-escalates from more turns alone |
 | Unified Audit Log | `frontend/src/components/AuditTimeline.tsx` ✅ (revamped 2026-09-05) | single unified, systemized audit log engine across TicketDrawer, DetailDrawer, and SimulateSession: strict chronological sorting via monotonic sortKey; first-class Customer Actions (link clicks, OTP entries, customer replies, silence); 7 category color themes with interactive count-badged filter pills; specialized inline cards for Payment Links, Mandate Renewals, Payment Captures, and PTP commitments | unified presentation; strictly chronological; identical contract across DB-backed and rehearsal surfaces |
 | Payment checkout page | `frontend/src/pages/PayCheckout.tsx` ✅ (new 2026-09-05) | standalone `/pay/:token` page (no `AppShell` chrome) — OTP-entry simulation, bounded retry, terminal state past `MAX_ATTEMPTS` | the real customer-facing surface for the fake gateway; a real DB write via the backend's `/api/pay/{token}/attempt` |
 | Webhook listener | `app/webhooks/listener.py` ✅ | ingest Razorpay **test-mode** webhook deliveries as `detected` events | HMAC-SHA256 signature verified over the raw body; idempotent (dedup by event id); success/unknown events acknowledged but ignored; amounts paise→₹; no PII stored (emails/phones hashed) |
@@ -642,7 +706,12 @@ like, not one.
 | Tester-picked checkout outcome, not a random roll (2026-09-05) | `click_payment_link(..., forced_reason=...)` builds the `CaptureResult` locally instead of calling `payment.resolve_fake_capture` when the tester explicitly picks a mistake at the embedded checkout screen; `forced_reason=None` (every other caller) keeps the original random-roll path byte-for-byte | a rehearsal is for **demonstrating** each recovery path on demand (wrong OTP vs. wrong password vs. insufficient funds), not for hoping a random roll lands on the one you want to show a judge; keeping it opt-in preserves the existing weighted-random behavior for every other caller |
 | `wrong_password` stays playground-only (2026-09-05) | added to `playground.py`'s local failure-copy map, never to `payment.py`'s `CaptureResult` reason vocabulary | `payment.py` is frozen and shared with the real, DB-writing `/pay/:token` flow (`AGENTS_CONTRACT.md` §11) — extending its contract for a sandbox-only distinction would ripple into `PayCheckout.tsx` and the real webhook-capture path for no real-flow benefit |
 | `salary_reminder_day` is a relative-day approximation, not a calendar date (2026-09-05) | `sim_state.salary_reminder_day = sim_day + 5` on an `insufficient_funds` checkout failure; never escalates | the real pipeline's `recovery.SALARY_WINDOW_DAY` targets a calendar day-of-month; the Playground's `sim_day` is only a relative turn counter with no calendar backing, so a bounded fixed offset is the honest sandbox equivalent — documented as an approximation rather than silently reusing the real constant's semantics |
-| PTP → simulated human review is UI state, not a ticket write (2026-09-05) | `SimulateSession.tsx`'s `ticketStatus` (`'none'\|'ptp_human_review'\|'recovered'`) drives a banner and disables the AI Simulation Engine buttons while "with a human"; clears to `'recovered'` when a later checkout succeeds | rehearses what a real triage hand-off *feels like* (case parked, only the payment-link path stays live, then closes out on payment) without touching the real `tickets` table — consistent with `playground.py` never calling `insert_ticket`/`update_event`/`log_action` |
+| Ticket-status UI state, not a ticket write (2026-09-05, superseded by the S10 row below) | `SimulateSession.tsx`'s `ticketStatus` drives a banner without touching the real `tickets` table | rehearses what a real triage hand-off *feels like* without ever calling `insert_ticket`/`update_event`/`log_action` — `playground.py`'s frozen sandboxing contract |
+| PTP escalation must never be triggered by the generic attempts ladder (2026-09-05, S10, bugfix) | `_resolve_escalation_reason`'s attempts/escalation-stage ceiling check now explicitly excludes `base_outcome in ("ptp_promised", "resolved")`; a whole parallel state machine (`ptp_active`/`ptp_target_day`) suspends that ladder entirely for as long as a promise is outstanding | a real bug surfaced in a live transcript the user reviewed: a customer who'd just agreed to pay was immediately re-escalated to "human review" in the same turn purely because it happened to be their 3rd exchange — a Promise-to-Pay is a *positive* outcome and must never be silently overridden by an unrelated counter crossing a threshold |
+| A Promise-to-Pay only escalates for two specific reasons, never "more turns happened" (2026-09-05, S10) | `ptp_overdue` (`sim_day >= ptp_target_day`, unpaid) or `ptp_payment_failed` (a `click_payment_link` attempt made while the promise is outstanding fails) — nothing else can end a PTP early except an explicit human request | mirrors the real product's actual design intent (`app/agents/ptp.py`'s `PROMISED → HONORED\|BROKEN` state machine, confirmed via research: broken = overdue past a grace period, not "the automation got impatient") — a promise is a deliberate pause on the escalation ladder, not a countdown to one |
+| Customer-facing dates are calendar strings, never `sim_day` (2026-09-05, S10) | `_format_calendar_date`/`_ordinal` produce e.g. "1st October"; `salary_reminder_date_label` reuses `recovery._next_salary_window`, `ptp_target_date_label` uses a plain `+5`-day wall-clock offset; `sim_day` itself stays an internal relative gating counter, never shown to a user | a rehearsal that tells a customer "I'll remind you on Day 8" reads as an obvious simulation artifact, not a believable date — the real product's `recovery.py` already formats no better (raw ISO timestamps, confirmed via research), so this Playground path is now stricter about presentation than the real pipeline, deliberately |
+| Reminder-cadence gate caps identical nudges, resets on a genuinely different ask (2026-09-05, S10) | `_classify_reminder_cta` tags each reminder's ask; `_reminder_gate` suppresses an identical tag repeating the same `sim_day`, escalates as `reminders_exhausted` past 3 distinct days, and resets the count the moment the tag changes | the UI already advertises "Max 3 automated reminders (24h cooldown)" but nothing enforced it — a live transcript showed the same "you cancelled the payment" line sent twice back-to-back, which is what a real customer would call spam, not diligence |
+| `ticketStatus` gains a `'ptp_pending'` state distinct from `'human_review'` (2026-09-05, S10) | `SimulateSession.tsx`'s `ticketStatus`: `'none' \| 'ptp_pending' \| 'human_review' \| 'recovered'`; `isActionable` (`outcome==='ongoing'\|\|'ptp_promised'`) gates the AI Simulation Engine buttons and chat input instead of `outcome==='ongoing'` alone | a Promise-to-Pay is a *wait*, not a stop — the previous single `'ptp_human_review'` state both mislabeled the case as "with a human" and (via `outcome!=='ongoing'` disabling every button) made it impossible for the tester to advance turns/days far enough to ever see the promise resolve or go overdue |
 
 ---
 

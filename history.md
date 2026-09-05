@@ -4,6 +4,72 @@ Running changelog. Newest entry first. Each entry is a short brief; the full
 reference lives in [documentation.md](documentation.md) and
 [architecture.md](architecture.md).
 
+## 2026-09-05 — Simulate tab: PTP escalation bugfix + reminder cadence
+
+- **Did:** The user pasted a live rehearsal transcript and caught a real bug
+  by hand: the agent logged "Promise-to-Pay recorded" and the very next line
+  was "Escalated to human review queue: max attempts exceeded" — a customer
+  who'd just agreed to pay was silently re-escalated in the same turn, purely
+  because `_resolve_escalation_reason` checked the attempts/escalation-stage
+  ceiling with no regard for what the outcome already was that turn. Also
+  flagged: the same failure message ("aapne payment cancel kar diya") sent
+  twice back-to-back with identical timestamps (no reminder-spam guard); the
+  `insufficient_funds` reschedule said "Day 8" instead of a real date; and
+  once a PTP was recorded, Next Turn/Auto-Run went dead (`outcome!=='ongoing'`
+  disabled them), so there was no way to ever see a promise resolve or go
+  overdue. Dispatched `simulation-engine-builder` for
+  `backend/app/agents/playground.py`: (1) `_resolve_escalation_reason` now
+  never fires the attempts ceiling when `base_outcome` is `ptp_promised`/
+  `resolved`; (2) a full PTP state machine (`ptp_active`/`ptp_target_day`/
+  `ptp_target_date_label`, `_activate_ptp_if_needed`/`_apply_turn_state_machine`)
+  decouples a promise from the generic attempts ladder entirely — while
+  active, escalation can only come from `ptp_overdue` (promised date passes
+  unpaid), `ptp_payment_failed` (a `click_payment_link` attempt while
+  outstanding fails — composes with `forced_reason`), or an explicit human
+  request; researched the real `app/agents/ptp.py` design first
+  (`PROMISED→HONORED|BROKEN`, broken = overdue past a 24h grace period) to
+  confirm a promise is meant to pause escalation, not accelerate it; (3) real
+  calendar-style dates (`_ordinal`/`_format_calendar_date`, reusing
+  `recovery._next_salary_window` for the salary reschedule) replace all
+  `"Day N"` customer-facing text; (4) a reminder-cadence gate
+  (`reminder_cta`/`reminder_days`, `_classify_reminder_cta`/`_reminder_gate`)
+  suppresses an identical same-day reminder and escalates as
+  `reminders_exhausted` past 3 distinct days, resetting on a genuinely
+  different ask — `send_message`/`advance_conversation` can now return
+  `{"suppressed": true, "turn"/"agent_turn": None}`. Frontend
+  (`SimulateSession.tsx`): `ticketStatus` split `'ptp_pending'` (its own
+  "Awaiting Settlement" banner) from `'human_review'` (only reached via a real
+  escalation now); new `isActionable` (`outcome==='ongoing'||'ptp_promised'`)
+  gates Next Turn/Auto-Run/chat input/the PTP button so the tester can watch a
+  promise play out instead of the session going dead the instant it's
+  recorded; `send`/`advance`/`playToResolution` handle the new
+  `suppressed`/null-turn shape instead of crashing on it.
+- **Verified:** Researched the real `ptp.py`/`TicketReason`/`recovery.py`
+  salary-window design first (no PTP-specific ticket reason exists today, no
+  dedicated PTP dashboard section exists in the real app either, real
+  salary-window dates are raw ISO timestamps with no human formatting) so the
+  sandbox redesign's terminology and escalation timing genuinely mirrors
+  the real product's intent rather than inventing new semantics.
+- **Docs:** `AGENTS_CONTRACT.md` §12/§13 (new entry S10), `documentation.md`
+  (`playground.py` and `SimulateSession.tsx` rows, top changelog),
+  `architecture.md` (§6.2 corrected sequence diagram, §7 component row, §8
+  five new/updated decision rows, top changelog), `plan.md` §12 — all updated
+  in this pass.
+- **Tests:** `uv run pytest tests/test_playground.py tests/test_api.py -q` →
+  all green (64 in `test_playground.py`, 15 new). `npx tsc -b` / `npm run
+  build` (frontend) both clean.
+- **Next:** Flagged by the builder agent and worth knowing: the reminder-cadence
+  gate's `reminders_exhausted` (4th distinct day) and the generic attempts
+  ceiling (`MAX_RETRY_ATTEMPTS=3`) are independent counters that both advance
+  once per non-PTP turn — in a typical one-exchange-per-day conversation the
+  attempts ceiling will usually fire first, so `reminders_exhausted` is fully
+  correct and unit-tested but rarely the *first* reason to trigger in
+  practice. Not a bug, just worth knowing if a demo run doesn't visibly hit
+  it. Still not done: an actual manual click-through in a running dev server
+  watching a PTP go all the way to overdue.
+
+---
+
 ## 2026-09-05 — Simulate tab Controls & Actions rework
 
 - **Did:** Fixed the Simulate tab's right-hand "Controls & Actions" panel

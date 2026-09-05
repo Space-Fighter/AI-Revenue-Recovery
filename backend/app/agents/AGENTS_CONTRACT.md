@@ -1,6 +1,23 @@
 # AGENTS_CONTRACT.md — frozen cross-agent contract
 
-Last updated: 2026-09-05 — simulation-engine amendment (S9): `click_payment_link`
+Last updated: 2026-09-05 — simulation-engine amendment (S11): fixed two real
+transcript bugs — an unambiguous customer agreement ("okay") after an explicit
+payment-link offer was not registering as `ptp_promised` because the LLM's own
+`outcome` judgment silently overrode the deterministic agreement signal; and a
+bare `"?"` in the customer's message (e.g. "Are you a bot?") force-fired the
+canned root-cause-explanation branch verbatim, even for questions unrelated to
+the payment failure. See §12/§13.
+
+Previously (2026-09-05): simulation-engine amendment (S10): fixed a real bug
+where an escalation could clobber a same-turn `ptp_promised`/`resolved`
+outcome; decoupled Promise-to-Pay from the generic attempts/escalation-stage
+ladder into its own small state machine (`ptp_active`/`ptp_target_day`/
+`ptp_target_date_label`); replaced raw `"Day N"` customer-facing wording with
+real calendar-style dates; added a reminder-cadence gate (`reminder_cta`/
+`reminder_days`) against repeating an identical pre-PTP nudge same-day or
+past 3 distinct days. See §12/§13.
+
+Previously (2026-09-05): simulation-engine amendment (S9): `click_payment_link`
 gained an optional `forced_reason` param for the tester-driven fake-checkout
 screen, a playground-only `wrong_password` failure reason, and an
 `insufficient_funds` carve-out (never escalates; reschedules
@@ -580,9 +597,17 @@ keeps working.
   "outstanding_asks": [],                  // list[str], keyword-matched customer asks not yet addressed
   "last_reply_text": null,                 // string | null -- anti-repetition for the deterministic fallback
   "capture_attempts": 0,                   // bounded ~3 attempts at click_payment_link, mirrors /pay/:token
-  "salary_reminder_day": 0                 // 0 = not scheduled; set to sim_day+5 on an insufficient_funds
+  "salary_reminder_day": 0,                // 0 = not scheduled; set to sim_day+5 on an insufficient_funds
                                             // capture failure (sandbox analogue of recovery.SALARY_WINDOW_DAY,
                                             // since sim_day is a relative counter, not a calendar date) (S9)
+  "salary_reminder_date_label": "",        // real calendar-style string shown to the customer, e.g. "1st October" (S10)
+  "ptp_active": false,                     // true from outcome=="ptp_promised" until paid (resolved) or broken
+                                            // (overdue / a payment attempt made while outstanding fails) (S10)
+  "ptp_target_day": 0,                     // 0 = unset; internal sim_day the promise is due (sim_day+5 when set) (S10)
+  "ptp_target_date_label": "",             // calendar-style string matching ptp_target_day, e.g. "6th September" (S10)
+  "reminder_cta": "",                      // short tag for the current pre-PTP reminder's ask; "" = none yet (S10)
+  "reminder_days": []                      // list[int], deduped sim_day values the current reminder_cta has
+                                            // already been sent on -- resets whenever the CTA genuinely changes (S10)
 }
 ```
 
@@ -629,7 +654,8 @@ def click_payment_link(event, history, channel="call", *, sim_state=None, settin
 
 ```jsonc
 {
-  "reason": "customer_requested_human" | "out_of_scope" | "max_attempts_exceeded",
+  "reason": "customer_requested_human" | "out_of_scope" | "max_attempts_exceeded"
+           | "ptp_overdue" | "ptp_payment_failed" | "reminders_exhausted",  // last three added S10
   "outstanding_asks": [],
   "last_customer_message": "...",
   "root_cause": "insufficient_funds",
@@ -716,3 +742,9 @@ merge, not for an exact list match.
 | S6 | When a human takes over as the Resolver, how is the conversation outcome declared? | An explicit optional `outcome` param on `send_message` when `speaker="agent"`, trusted as-supplied, never inferred from the human's freeform text — inferring intent from arbitrary human phrasing is unreliable. |
 | S7 | Is `_DEFERRAL_PATTERNS` (e.g. "kal", "tomorrow") part of the frozen contract? | No — same latitude as the `outstanding_asks` keyword map (S1): the builder defines it freely; team-lead reviews for reasonable coverage at merge, not an exact-list match. |
 | S9 | Embedded fake-checkout screen needs a tester-forced payment outcome (success/wrong OTP/wrong password/cancelled/insufficient funds) instead of a random roll — how, without breaking S2's pure/stateless guarantee or payment.py's frozen `CaptureResult` vocabulary? | Added `click_payment_link(..., forced_reason: str | None = None)` — no new param on `payment.resolve_fake_capture`, no `session` anywhere. `forced_reason=None` (default) is unchanged; when set, `resolve_fake_capture` is skipped and a `CaptureResult`-shaped dict is built locally in `playground.py` with the same `_q`/`MONEY` paise-rounding convention. `wrong_password` is a playground-only reason (login/credentials failure before the OTP step) — deliberately **not** added to `payment.py`, since that module's `CaptureResult` vocabulary (`captured`/`insufficient_funds`/`wrong_otp`/`user_cancelled`) is frozen and shared with the real DB-writing `/pay/:token` flow; a fifth reason there would ripple into `apply_capture`'s payload shape and the real webhook path for no real-flow benefit. Also carved out: `insufficient_funds` (forced or randomly rolled) never escalates on attempt-count, unlike every other failure reason — it schedules `sim_state["salary_reminder_day"] = sim_day + 5` instead and stays "ongoing". `sim_day` is only a relative rehearsal counter, not a calendar date, so `+5` is a bounded, deterministic sandbox approximation of `recovery.SALARY_WINDOW_DAY`, not a claim of calendar accuracy. |
+| S10a | A real production transcript showed "Promise-to-Pay logged" immediately followed by "Escalated: max attempts exceeded" in the same turn — how? | A genuine bug: `_resolve_escalation_reason`'s attempts-exceeded check fired purely from `attempts_so_far`/`escalation_stage`, blind to what `base_outcome` already was this turn. Fixed: that check now explicitly excludes `base_outcome in ("ptp_promised", "resolved")` — a positive outcome for the current turn is never silently overridden. An explicit human demand (`human_requested`) still always wins regardless, unchanged. |
+| S10b | Even after S10a's same-turn fix, why did a PTP still eventually escalate a few turns later just from more turns happening — and how was it decoupled? | The generic attempts/escalation-stage ladder kept incrementing every turn even after a PTP was recorded, so it would cross the ceiling a few turns on. A Promise-to-Pay is conceptually a *different* track (the customer already agreed; more chat turns are not "more failed attempts") — it should only end via (a) going overdue or (b) an explicit post-promise payment failure, never via elapsed turn count. Added a small state machine in `sim_state` (`ptp_active`/`ptp_target_day`/`ptp_target_date_label`, offset `sim_day + 5` on first promise, sharing the same bounded-offset convention as `salary_reminder_day`). While `ptp_active`, `_apply_turn_state_machine` skips the attempts/escalation-stage increment-and-check block entirely (an explicit human demand still escalates immediately, and a genuinely out-of-scope base outcome still escalates) — instead it checks `sim_day >= ptp_target_day` every turn and escalates `"ptp_overdue"` if so. `click_payment_link` separately escalates `"ptp_payment_failed"` the moment a payment attempt made while `ptp_active` comes back `captured=False` (composes with `forced_reason` identically to a randomly-rolled failure), and clears `ptp_active` on either a successful capture or any of these escalations. |
+| S10c | Why calendar-style dates instead of `sim_day` in customer-facing text? | A raw internal counter ("Day 8") was leaking into what should read as a real appointment/date to the customer/tester. `sim_day` stays purely an internal relative gating counter; a new `_ordinal`/`_format_calendar_date` pair renders a real wall-clock-derived string ("1st October") for both the `insufficient_funds` reschedule message (via `recovery._next_salary_window`, imported — this path specifically simulates the salary-credit-window concept) and the PTP target-date message (a plain `datetime.now(timezone.utc) + timedelta(days=5)`, since a generic promise doesn't need the salary-window's month-boundary semantics). Both labels are also stored in `sim_state` (`salary_reminder_date_label`, `ptp_target_date_label`) so a frontend can display them without recomputing. |
+| S10d | How is reminder-spam (repeating an identical nudge, or nagging indefinitely) prevented without inventing a new return shape everywhere? | Added `_classify_reminder_cta` (an approximate, UX-only tag: `send_payment_link` / `explain_failure` / `stalled_handoff` / `generic_nudge`) and `_reminder_gate(sim_state, cta, day)`, gated only on turns whose outcome is (still) `"ongoing"` and only while no PTP is active (once a PTP is active there are no more automated nudges to gate). A genuinely different CTA resets the count; the identical CTA same-day suppresses (no new agent turn is added this call — smaller/cleaner than a new shape, equivalent in spirit to `advance_conversation`'s existing `no_response` shape, flagged via `"suppressed": True`); the identical CTA across more than 3 distinct days escalates `"reminders_exhausted"`. |
+| S11a | A real transcript: customer replied "okay" to an explicit "should I send you the payment link?" offer, yet the conversation stayed `"ongoing"` for several more turns and eventually escalated `max_attempts_exceeded` without ever recording a Promise-to-Pay — why? | The deterministic bare-agreement check (`has_agreement` in `_fallback_agent_reply` branch 5) only ever ran when the LLM path wasn't used at all (unavailable, or the call raised and the fallback `result` survived unmodified). When the LLM call *succeeded*, `_parse_agent_reply`'s output fully replaced `result`, silently discarding the deterministic signal even when the LLM's own outcome judgment was wrong. Fix: extracted the check into a standalone `_is_clear_agreement(text)` (identical semantics to the old `has_agreement` — an `_AGREE_PHRASES` substring match, or a bare word from a fixed set when the message isn't also a question) and a new `_apply_agreement_override(result, message, persona)` that runs AFTER the LLM call (success or fallback) and BEFORE `_apply_turn_state_machine` in both `send_message`'s `speaker="customer"` branch and `advance_conversation`: if the message is a clear agreement and the outcome is still `"ongoing"`, it's forced to `"ptp_promised"`, swapping in the canned `_ptp_confirmation_reply` (factored out of branch 5, also reused there) unless the LLM's own reply already looks like it offered/confirmed the link. Never applied to `send_message`'s `speaker="agent"` (human-takeover) branch, which always trusts the human-supplied outcome as-is. Because the override runs before `_apply_turn_state_machine`, an overridden `ptp_promised` activates the S10 PTP state machine exactly like an LLM-native one would — no special-casing needed there. |
+| S11b | Same transcript: the customer's off-topic "Are you a bot?" triggered the exact same canned root-cause-explanation reply as an earlier, unrelated failure question, verbatim — why, and is this only a fallback-path issue? | It's specifically a fallback-path (no-LLM / LLM-raised) issue: `_fallback_agent_reply` branch 4's `has_question` check was `any(w in text for w in _QUESTION_WORDS) or "?" in text` — the bare `"?" in text` alone fires it for *any* question-shaped message, regardless of topic, and that branch has zero phrasing variation (unlike `_DEFAULT_REPLY_VARIANTS`), so repeated unrelated questions get byte-identical replies. Fix: added a new branch 3.5 ahead of it — a small `_IDENTITY_WORDS` keyword set ("bot", "robot", "AI ho", "insaan ho", "real hai", "machine", ...) that answers the identity question honestly and stays `"ongoing"` (no escalation just for asking — that stays orthogonal, gated only by the existing `_HUMAN_REQUEST_PATTERNS` check). Branch 4 itself was narrowed: `"?" in text` alone no longer qualifies as `has_question` — it now additionally requires a `_FAILURE_DOMAIN_WORDS` hit (a payment/failure-related keyword) alongside the bare `"?"`, on top of the existing `_QUESTION_WORDS` match. Genuine failure questions ("kyu fail hua?") still match via `_QUESTION_WORDS` unchanged. |

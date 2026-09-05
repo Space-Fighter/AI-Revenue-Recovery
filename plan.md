@@ -525,6 +525,39 @@ This project is being built *for* Razorpay, evaluated *by* Razorpay engineers, o
   constant targets a calendar day-of-month; `sim_day` has no calendar
   backing). 50 backend tests green (`test_playground.py`, 13 new); full
   `documentation.md`/`architecture.md` deltas applied same-pass.
+- **Simulate tab: PTP escalation bugfix + reminder cadence (2026-09-05):**
+  a real bug surfaced in a live transcript the user reviewed by hand: the
+  agent logged "Promise-to-Pay recorded" and the *very next line* was
+  "Escalated to human review queue: max attempts exceeded" — a customer who
+  had just agreed to pay was being silently re-escalated in the same turn,
+  purely because the generic attempts/escalation-stage ceiling happened to be
+  crossed. `_resolve_escalation_reason` (`backend/app/agents/playground.py`)
+  now never fires that ceiling when the outcome this turn is already
+  `ptp_promised`/`resolved`. Beyond the immediate fix, a Promise-to-Pay is now
+  a proper state machine decoupled from the attempts ladder entirely
+  (`sim_state.ptp_active`/`ptp_target_day`/`ptp_target_date_label`) —
+  confirmed against the real `app/agents/ptp.py` design (`PROMISED →
+  HONORED|BROKEN`, broken = overdue past a grace period) that a promise is
+  meant to *pause* escalation, not accelerate it: it now only escalates via
+  `ptp_overdue` (the promised date passes unpaid) or `ptp_payment_failed` (a
+  payment attempt made while the promise is outstanding fails), never from
+  "more turns happened." Customer-facing dates are now real calendar strings
+  ("1st October"), never raw `"Day N"` — `_format_calendar_date`/`_ordinal`,
+  reusing `recovery._next_salary_window` for the `insufficient_funds`
+  reschedule. A new reminder-cadence gate (`reminder_cta`/`reminder_days`)
+  stops the same automated nudge from repeating same-day (observed in the
+  same transcript: an identical "you cancelled the payment" line sent twice
+  back-to-back) and caps it at 3 distinct days before handing off
+  (`reminders_exhausted`), resetting whenever the actual ask changes.
+  `AGENTS_CONTRACT.md` §12/§13 new entry S10. Frontend (`SimulateSession.tsx`):
+  `ticketStatus` split into `'ptp_pending'` (its own "Awaiting Settlement"
+  banner, not lumped into `'human_review'`) vs `'human_review'`
+  (only reached via a genuine escalation now); the AI Simulation Engine
+  buttons and chat input now stay enabled through `outcome==='ptp_promised'`
+  (previously `outcome!=='ongoing'` disabled them the instant a PTP was
+  recorded, making it impossible to ever watch a promise resolve or go
+  overdue). 64 backend tests green (`test_playground.py`, 15 new); full
+  `documentation.md`/`architecture.md` deltas applied same-pass.
 - **Approved deviations from this brief:** PostgreSQL (not SQLite) — run as a
   local process via `scripts/pg.ps1` since Docker needs WSL2 (unavailable on this
   Win 11 Home box); `uv` (not `pip`/`requirements.txt`); a FastAPI **backend/** +

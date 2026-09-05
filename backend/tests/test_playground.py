@@ -8,6 +8,7 @@ sandboxing-guarantee tests use the `session` fixture specifically to prove
 that a full session, in either mode, never touches events/tickets/audit_log.
 """
 
+import re
 from decimal import Decimal
 
 import pytest
@@ -658,6 +659,9 @@ def test_click_payment_link_forced_user_cancelled(monkeypatch):
 
 
 def test_click_payment_link_forced_insufficient_funds_mentions_rescheduled_day(monkeypatch):
+    """S10: the customer-facing message shows a real calendar-style date
+    (e.g. "1st October"), never the raw "Day N" wording -- `sim_day` stays an
+    internal relative gating counter only."""
     event = _event()
     monkeypatch.setattr(
         pg.payment, "resolve_fake_capture",
@@ -675,7 +679,10 @@ def test_click_payment_link_forced_insufficient_funds_mentions_rescheduled_day(m
     assert result["outcome"] == "ongoing"
     expected_day = day_before + 5
     assert result["sim_state"]["salary_reminder_day"] == expected_day
-    assert str(expected_day) in result["turn"]["text"]
+    assert result["sim_state"]["salary_reminder_date_label"]
+    assert not re.search(r"\bDay \d+\b", result["turn"]["text"])
+    assert re.search(r"[A-Z][a-z]+", result["turn"]["text"])  # a month name is present
+    assert result["sim_state"]["salary_reminder_date_label"] in result["turn"]["text"]
 
 
 def test_click_payment_link_insufficient_funds_never_escalates_after_many_attempts(monkeypatch):
@@ -706,3 +713,347 @@ def test_click_payment_link_has_no_session_parameter():
 
     params = inspect.signature(pg.click_payment_link).parameters
     assert "session" not in params
+
+
+# --- S10: calendar-style dates -----------------------------------------
+
+def test_ordinal_formatting():
+    assert pg._ordinal(1) == "1st"
+    assert pg._ordinal(2) == "2nd"
+    assert pg._ordinal(3) == "3rd"
+    assert pg._ordinal(4) == "4th"
+    assert pg._ordinal(11) == "11th"
+    assert pg._ordinal(12) == "12th"
+    assert pg._ordinal(13) == "13th"
+    assert pg._ordinal(21) == "21st"
+    assert pg._ordinal(22) == "22nd"
+    assert pg._ordinal(23) == "23rd"
+
+
+# --- S10: escalation must never clobber a same-turn PTP/resolved outcome ---
+
+def test_resolve_escalation_reason_never_overrides_ptp_or_resolved():
+    st = pg._default_sim_state("custom")
+    st["attempts_so_far"] = pg.MAX_RETRY_ATTEMPTS
+    st["escalation_stage"] = pg.MAX_ESCALATION_STAGE
+    assert pg._resolve_escalation_reason(
+        human_requested=False, sim_state=st, base_outcome="ptp_promised"
+    ) is None
+    assert pg._resolve_escalation_reason(
+        human_requested=False, sim_state=st, base_outcome="resolved"
+    ) is None
+    assert pg._resolve_escalation_reason(
+        human_requested=False, sim_state=st, base_outcome="ongoing"
+    ) == "max_attempts_exceeded"
+    # an explicit human demand still always wins
+    assert pg._resolve_escalation_reason(
+        human_requested=True, sim_state=st, base_outcome="ptp_promised"
+    ) == "customer_requested_human"
+
+
+def test_agreement_on_turn_that_would_exceed_attempts_stays_ptp_promised():
+    """S10 bugfix: a customer agreeing to pay on their Nth turn, where N
+    would previously have triggered max_attempts_exceeded, must stay
+    ptp_promised, not get clobbered into escalated same-turn."""
+    event = _event()
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    history = session["history"]
+    st = session["sim_state"]
+    for _ in range(pg.MAX_RETRY_ATTEMPTS - 1):
+        result = pg.send_message(event, history, "hmm accha", session["channel"], sim_state=st, settings=_NO_LLM)
+        history = result["history"]
+        st = result["sim_state"]
+        assert result["outcome"] == "ongoing"
+    assert st["attempts_so_far"] == pg.MAX_RETRY_ATTEMPTS - 1
+
+    result = pg.send_message(
+        event, history, "Haan theek hai, main abhi pay karta hoon", session["channel"],
+        sim_state=st, settings=_NO_LLM,
+    )
+    assert result["outcome"] == "ptp_promised"
+    assert "escalation" not in result
+    assert result["sim_state"]["ptp_active"] is True
+
+
+# --- S10: Promise-to-Pay is its own state machine, decoupled from the ladder -
+
+def test_ptp_active_persists_across_ordinary_turns_without_auto_escalation():
+    event = _event()
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    result = pg.send_message(
+        event, session["history"], "Haan theek hai, main abhi pay karta hoon", session["channel"],
+        settings=_NO_LLM,
+    )
+    assert result["outcome"] == "ptp_promised"
+    st = result["sim_state"]
+    assert st["ptp_active"] is True
+    assert st["ptp_target_day"] > st["sim_day"]
+    assert st["ptp_target_date_label"]
+    history = result["history"]
+    for _ in range(5):
+        result = pg.send_message(
+            event, history, "Haan bilkul, pay kar dunga jaldi", session["channel"],
+            sim_state=st, settings=_NO_LLM,
+        )
+        history = result["history"]
+        st = result["sim_state"]
+        assert result["outcome"] == "ptp_promised"
+        assert st["ptp_active"] is True
+        assert "escalation" not in result
+
+
+def test_ptp_overdue_escalates_when_target_day_reached_unpaid():
+    event = _event()
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    result = pg.send_message(
+        event, session["history"], "Haan theek hai, main abhi pay karta hoon", session["channel"],
+        settings=_NO_LLM,
+    )
+    st = result["sim_state"]
+    assert st["ptp_active"] is True
+    st["sim_day"] = st["ptp_target_day"]  # the promise is now overdue, nothing paid
+
+    result2 = pg.send_message(
+        event, result["history"], "abhi tak nahi kar paya", session["channel"], sim_state=st, settings=_NO_LLM,
+    )
+    assert result2["outcome"] == "escalated"
+    assert result2["escalation"]["reason"] == "ptp_overdue"
+    assert result2["sim_state"]["ptp_active"] is False
+
+
+def test_click_payment_link_failure_while_ptp_active_escalates_ptp_payment_failed(monkeypatch):
+    event = _event()
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    result = pg.send_message(
+        event, session["history"], "Haan theek hai, main abhi pay karta hoon", session["channel"],
+        settings=_NO_LLM,
+    )
+    st = result["sim_state"]
+    assert st["ptp_active"] is True
+
+    monkeypatch.setattr(
+        pg.payment, "resolve_fake_capture",
+        lambda evt, link_id, *, settings, attempt=1: {"captured": False, "reason": "wrong_otp", "amount": evt.amount},
+    )
+    failed = pg.click_payment_link(event, result["history"], "call", sim_state=st, settings=_NO_LLM)
+    assert failed["outcome"] == "escalated"
+    assert failed["escalation"]["reason"] == "ptp_payment_failed"
+    assert failed["sim_state"]["ptp_active"] is False
+
+
+def test_click_payment_link_forced_failure_while_ptp_active_also_escalates():
+    """forced_reason must compose with the PTP-outstanding check exactly like
+    a randomly-rolled failure would (S10 composes with S9's forced_reason)."""
+    event = _event()
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    result = pg.send_message(
+        event, session["history"], "Haan theek hai, main abhi pay karta hoon", session["channel"],
+        settings=_NO_LLM,
+    )
+    st = result["sim_state"]
+    failed = pg.click_payment_link(
+        event, result["history"], "call", sim_state=st, settings=_NO_LLM, forced_reason="user_cancelled",
+    )
+    assert failed["outcome"] == "escalated"
+    assert failed["escalation"]["reason"] == "ptp_payment_failed"
+    assert failed["sim_state"]["ptp_active"] is False
+
+
+def test_click_payment_link_success_while_ptp_active_clears_it_without_escalating(monkeypatch):
+    event = _event()
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    result = pg.send_message(
+        event, session["history"], "Haan theek hai, main abhi pay karta hoon", session["channel"],
+        settings=_NO_LLM,
+    )
+    st = result["sim_state"]
+    assert st["ptp_active"] is True
+
+    monkeypatch.setattr(
+        pg.payment, "resolve_fake_capture",
+        lambda evt, link_id, *, settings, attempt=1: {"captured": True, "reason": "captured", "amount": evt.amount},
+    )
+    paid = pg.click_payment_link(event, result["history"], "call", sim_state=st, settings=_NO_LLM)
+    assert paid["outcome"] == "resolved"
+    assert "escalation" not in paid
+    assert paid["sim_state"]["ptp_active"] is False
+
+
+# --- S10: reminder-cadence gate (pre-PTP nudge ladder only) -----------------
+
+def test_reminder_cadence_gate_suppresses_same_day_duplicate():
+    st = pg._default_sim_state("custom")
+    assert pg._reminder_gate(st, "generic_nudge", 1) == "send"
+    assert pg._reminder_gate(st, "generic_nudge", 1) == "suppress_same_day"
+
+
+def test_reminder_cadence_gate_exhausts_after_four_distinct_days():
+    st = pg._default_sim_state("custom")
+    assert pg._reminder_gate(st, "generic_nudge", 1) == "send"
+    assert pg._reminder_gate(st, "generic_nudge", 2) == "send"
+    assert pg._reminder_gate(st, "generic_nudge", 3) == "send"
+    assert pg._reminder_gate(st, "generic_nudge", 4) == "exhausted"
+
+
+def test_reminder_cadence_gate_resets_on_different_cta():
+    st = pg._default_sim_state("custom")
+    assert pg._reminder_gate(st, "generic_nudge", 1) == "send"
+    assert pg._reminder_gate(st, "generic_nudge", 2) == "send"
+    assert pg._reminder_gate(st, "send_payment_link", 2) == "send"  # a genuinely different ask resets
+    assert st["reminder_cta"] == "send_payment_link"
+    assert st["reminder_days"] == [2]
+
+
+def test_apply_turn_state_machine_suppresses_same_day_duplicate_reminder():
+    st = pg._default_sim_state("custom")
+    reply = {"reply": "Koi baat nahi, jab convenient ho payment kar dijiye.", "outcome": "ongoing", "reasoning": ""}
+    st["sim_day"] = 1
+    _, escalation_reason, suppressed = pg._apply_turn_state_machine(st, human_requested=False, result=dict(reply))
+    assert escalation_reason is None
+    assert suppressed is False
+
+    st["attempts_so_far"] = 0
+    st["escalation_stage"] = 0
+    _, escalation_reason2, suppressed2 = pg._apply_turn_state_machine(st, human_requested=False, result=dict(reply))
+    assert suppressed2 is True
+    assert escalation_reason2 is None
+
+
+def test_apply_turn_state_machine_reminder_exhaustion_escalates():
+    st = pg._default_sim_state("custom")
+    reply = {"reply": "Koi baat nahi, jab convenient ho payment kar dijiye.", "outcome": "ongoing", "reasoning": ""}
+    for day in (1, 2, 3):
+        st["sim_day"] = day
+        st["attempts_so_far"] = 0
+        st["escalation_stage"] = 0
+        _, escalation_reason, suppressed = pg._apply_turn_state_machine(st, human_requested=False, result=dict(reply))
+        assert escalation_reason is None
+        assert suppressed is False
+
+    st["sim_day"] = 4
+    st["attempts_so_far"] = 0
+    st["escalation_stage"] = 0
+    result, escalation_reason, suppressed = pg._apply_turn_state_machine(st, human_requested=False, result=dict(reply))
+    assert escalation_reason == "reminders_exhausted"
+    assert result["outcome"] == "escalated"
+    assert suppressed is False
+
+
+# --- S11: clear-agreement override + narrowed identity/bot detection -------
+
+def test_clear_agreement_overrides_llm_ongoing_outcome_in_send_message(monkeypatch):
+    """A real transcript bug: the customer said an unambiguous 'okay' but the
+    LLM's own outcome judgment stayed 'ongoing' -- the deterministic backstop
+    must force ptp_promised regardless."""
+    event = _event()
+    monkeypatch.setattr(pg.llm, "available", lambda s: True)
+    monkeypatch.setattr(pg.llm, "chat", lambda *a, **k: "opening line")
+    monkeypatch.setattr(
+        pg.llm, "chat_turns",
+        lambda *a, **k: '{"reply": "Theek hai, sochta hoon.", "outcome": "ongoing", "reasoning": "customer non-committal"}',
+    )
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    result = pg.send_message(event, session["history"], "okay", session["channel"], settings=_NO_LLM)
+    assert result["outcome"] == "ptp_promised"
+    assert result["sim_state"]["ptp_active"] is True
+
+
+def test_clear_agreement_overrides_llm_ongoing_outcome_in_advance_conversation(monkeypatch):
+    event = _event()
+    monkeypatch.setattr(pg.llm, "available", lambda s: True)
+    monkeypatch.setattr(pg.llm, "chat", lambda *a, **k: "opening line")
+
+    def _fake_chat_turns(system, turns, *, settings, max_tokens=400):
+        if "Recovery Agent" in system:
+            return '{"reply": "Theek hai, sochta hoon.", "outcome": "ongoing", "reasoning": ""}'
+        return "yes"
+
+    monkeypatch.setattr(pg.llm, "chat_turns", _fake_chat_turns)
+    history = pg.start_session(event, mode="ai", settings=_NO_LLM)["history"]
+    result = pg.advance_conversation(event, history, "call", settings=_NO_LLM)
+    assert result["outcome"] == "ptp_promised"
+    assert result["sim_state"]["ptp_active"] is True
+
+
+def test_agreement_override_does_not_fire_on_a_question(monkeypatch):
+    """'yes, but why did it fail?' must NOT be forced into ptp_promised even
+    via the override -- the question guard holds."""
+    event = _event()
+    monkeypatch.setattr(pg.llm, "available", lambda s: True)
+    monkeypatch.setattr(pg.llm, "chat", lambda *a, **k: "opening line")
+    monkeypatch.setattr(
+        pg.llm, "chat_turns",
+        lambda *a, **k: '{"reply": "Explaining the failure.", "outcome": "ongoing", "reasoning": ""}',
+    )
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    result = pg.send_message(
+        event, session["history"], "yes, but why did it fail?", session["channel"], settings=_NO_LLM,
+    )
+    assert result["outcome"] == "ongoing"
+
+
+def test_agreement_override_never_applies_to_human_takeover(monkeypatch):
+    """speaker='agent' with an explicitly-supplied outcome must not be
+    touched by the clear-agreement override."""
+    event = _event()
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    result = pg.send_message(
+        event, session["history"], "okay", session["channel"],
+        speaker="agent", outcome="ongoing", settings=_NO_LLM,
+    )
+    assert result["outcome"] == "ongoing"
+
+
+def test_fallback_identity_question_gets_honest_answer_not_recycled_explanation():
+    """LLM unavailable: 'Are you a bot?' must not return the recycled
+    root-cause explanation text, and must stay 'ongoing'."""
+    event = _event()
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    result = pg.send_message(
+        event, session["history"], "Are you a bot?", session["channel"], settings=_NO_LLM,
+    )
+    assert result["outcome"] == "ongoing"
+    rc = event.root_cause
+    explanation = pg._ROOT_CAUSE_EXPLANATIONS.get(rc, "")
+    assert explanation not in result["turn"]["text"]
+    assert "Recovery Assistant" in result["turn"]["text"] or "bot" in result["turn"]["text"].lower() or "automated" in result["turn"]["text"].lower()
+
+
+def test_fallback_genuine_failure_question_still_gets_root_cause_explanation():
+    """Existing question-detection behavior for genuine failure questions
+    stays unchanged."""
+    event = _event()
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+    result = pg.send_message(
+        event, session["history"], "kyu fail hua?", session["channel"], settings=_NO_LLM,
+    )
+    assert result["outcome"] == "ongoing"
+    explanation = pg._ROOT_CAUSE_EXPLANATIONS.get(event.root_cause, "")
+    assert explanation in result["turn"]["text"]
+
+
+def test_send_message_suppresses_duplicate_reminder_same_day(monkeypatch):
+    event = _event()
+    session = pg.start_session(event, mode="custom", settings=_NO_LLM)
+
+    monkeypatch.setattr(pg.llm, "available", lambda s: True)
+    monkeypatch.setattr(pg.llm, "chat", lambda *a, **k: "opening line")
+    monkeypatch.setattr(
+        pg.llm, "chat_turns",
+        lambda *a, **k: '{"reply": "Koi baat nahi, jab convenient ho payment kar dijiye.", "outcome": "ongoing", "reasoning": ""}',
+    )
+
+    result1 = pg.send_message(
+        event, session["history"], "hmm accha", session["channel"],
+        sim_state=session["sim_state"], settings=_NO_LLM,
+    )
+    assert result1.get("suppressed") is not True
+    assert result1["outcome"] == "ongoing"
+
+    result2 = pg.send_message(
+        event, result1["history"], "hmm accha", session["channel"],
+        sim_state=result1["sim_state"], settings=_NO_LLM,
+    )
+    assert result2.get("suppressed") is True
+    assert result2["turn"] is None
+    assert result2["outcome"] == "ongoing"

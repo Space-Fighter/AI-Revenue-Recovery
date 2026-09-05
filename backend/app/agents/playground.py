@@ -45,6 +45,45 @@ fake-checkout screen pick the outcome explicitly ("success" | "wrong_otp" |
 "wrong_password" | "user_cancelled" | "insufficient_funds") instead of the
 random weighted roll; ``forced_reason=None`` (default) is byte-for-byte the
 existing ``payment.resolve_fake_capture``-driven behavior.
+
+S10 additions:
+
+* A Promise-to-Pay (``outcome="ptp_promised"``) is its own small state
+  machine (``sim_state.ptp_active``/``ptp_target_day``/
+  ``ptp_target_date_label``) decoupled from the generic
+  attempts/escalation-stage ladder -- once active, ordinary turns never
+  auto-escalate it. It only escalates when the promise goes overdue
+  (``"ptp_overdue"``) or a payment attempt made while it's outstanding
+  explicitly fails (``"ptp_payment_failed"``).
+* Any date shown to the customer is a real calendar-style string (e.g.
+  "1st October"), never a raw ``sim_day`` integer -- see ``_ordinal`` /
+  ``_format_calendar_date``.
+* A lightweight reminder-cadence gate (``_classify_reminder_cta`` /
+  ``_reminder_gate``) stops the pre-PTP nudge ladder from repeating an
+  identical ask same-day, and escalates (``"reminders_exhausted"``) once the
+  same ask has been sent on more than 3 distinct days.
+
+S11 fixes (a real transcript: customer said "okay" to an explicit payment-link
+offer and the LLM's own outcome stayed "ongoing" for several more turns,
+including a canned root-cause explanation repeated verbatim for an unrelated
+"Are you a bot?" question, until it wrongly escalated as
+``max_attempts_exceeded`` without ever recording a Promise-to-Pay):
+
+* ``_is_clear_agreement``/``_apply_agreement_override`` -- a deterministic
+  backstop, run AFTER the LLM call (success or fallback) and BEFORE
+  ``_apply_turn_state_machine``, in both ``send_message``'s
+  ``speaker="customer"`` branch and ``advance_conversation``: an unambiguous
+  bare agreement ("yes"/"haan"/"okay"/...) that isn't also a question forces
+  outcome ``"ptp_promised"`` even if the LLM's own outcome judgment disagreed.
+  Never applied to ``send_message``'s ``speaker="agent"`` (human-takeover)
+  branch, which always trusts the human's explicitly supplied outcome.
+* ``_fallback_agent_reply`` gained a new branch 3.5 (identity/"are you a
+  bot" detection, ``_IDENTITY_WORDS``) that answers honestly and stays
+  ``"ongoing"`` instead of mis-firing branch 4's canned root-cause
+  explanation just because the message happened to contain a bare ``"?"``;
+  branch 4 itself now requires an actual ``_QUESTION_WORDS`` hit, or a
+  failure/payment-domain keyword (``_FAILURE_DOMAIN_WORDS``) alongside the
+  ``"?"``, before it fires.
 """
 
 from __future__ import annotations
@@ -52,6 +91,7 @@ from __future__ import annotations
 import json
 import random
 import types
+from datetime import datetime, timedelta, timezone
 from typing import Any, Literal
 
 from app import llm
@@ -61,6 +101,7 @@ from app.agents.recovery import (
     MAX_ESCALATION_STAGE,
     MAX_RETRY_ATTEMPTS,
 )
+from app.agents.recovery import _next_salary_window
 from app.agents.recovery import _stable_hash as _recovery_stable_hash
 from decimal import Decimal
 
@@ -195,8 +236,27 @@ def _default_sim_state(mode: str) -> dict[str, Any]:
         # 0 = "not scheduled". Sandbox stand-in for recovery.SALARY_WINDOW_DAY:
         # this file has no calendar, only a relative sim_day counter, so an
         # insufficient-funds failure reschedules a reminder `sim_day + 5`
-        # rather than targeting a real day-of-month (S9).
+        # rather than targeting a real day-of-month (S9). The label is the
+        # real calendar-style date shown to the customer (S10) -- `sim_day`
+        # stays an internal relative gating counter only.
         "salary_reminder_day": 0,
+        "salary_reminder_date_label": "",
+        # Promise-to-Pay state machine (S10) -- decoupled from the generic
+        # attempts/escalation-stage ladder. `ptp_active` is True from the
+        # turn outcome becomes "ptp_promised" until it resolves (paid) or
+        # breaks (overdue / a payment attempt made while outstanding fails).
+        # `ptp_target_day` is the internal sim_day the promise is due
+        # (0 = unset); `ptp_target_date_label` is the matching calendar
+        # string shown to the customer/tester.
+        "ptp_active": False,
+        "ptp_target_day": 0,
+        "ptp_target_date_label": "",
+        # Reminder-cadence gate (S10, pre-PTP nudge ladder only): `reminder_cta`
+        # is a short tag for the ask the last reminder made ("" = none yet);
+        # `reminder_days` are the (deduped) sim_day values the *current* CTA
+        # has already been sent on. A genuinely different CTA resets both.
+        "reminder_cta": "",
+        "reminder_days": [],
     }
 
 
@@ -212,6 +272,7 @@ def _fill_sim_state(sim_state: dict[str, Any] | None, mode: str) -> dict[str, An
         **(sim_state.get("controlled_by") or {}),
     }
     merged["outstanding_asks"] = list(sim_state.get("outstanding_asks") or [])
+    merged["reminder_days"] = list(sim_state.get("reminder_days") or [])
     return merged
 
 
@@ -309,6 +370,64 @@ def _matches_any(text: str, patterns: tuple[str, ...]) -> bool:
     return any(p in t for p in patterns)
 
 
+# --- calendar-style dates (S10) ---------------------------------------------
+# `sim_day` stays an internal relative gating counter; anything shown to a
+# human/customer must be a real calendar-style string instead ("1st October",
+# never "Day 8").
+
+
+def _ordinal(n: int) -> str:
+    if 11 <= (n % 100) <= 13:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
+
+def _format_calendar_date(dt: datetime) -> str:
+    return f"{_ordinal(dt.day)} {dt.strftime('%B')}"
+
+
+# --- reminder-cadence gate (S10, pre-PTP nudge ladder only) -----------------
+# The UI already advertises "Max 3 automated reminders (24h cooldown)" -- this
+# enforces it: the identical ask is never repeated same-day, and the same ask
+# repeated across more than 3 distinct days hands off to a human instead of
+# nagging forever. Moot once a PTP is active -- there are no more automated
+# nudges being sent at all during that window (see _apply_turn_state_machine).
+
+_STALLED_HANDOFF_WORDS = ("human review queue", "senior team", "forward", "supervisor")
+_PAYMENT_LINK_WORDS = ("rzp.io", "payment link", "link bhej")
+
+
+def _classify_reminder_cta(reply_text: str) -> str:
+    """Approximate, UX-only classification of what the last reminder actually
+    asked for -- not a correctness-critical parser."""
+    text = reply_text.lower()
+    if any(w in text for w in _PAYMENT_LINK_WORDS):
+        return "send_payment_link"
+    if "?" in reply_text or any(
+        exp.lower()[:24] in text for exp in _ROOT_CAUSE_EXPLANATIONS.values()
+    ):
+        return "explain_failure"
+    if any(w in text for w in _STALLED_HANDOFF_WORDS):
+        return "stalled_handoff"
+    return "generic_nudge"
+
+
+def _reminder_gate(sim_state: dict[str, Any], cta: str, day: int) -> str:
+    """"send" | "suppress_same_day" | "exhausted"."""
+    if cta != sim_state["reminder_cta"]:
+        sim_state["reminder_cta"] = cta
+        sim_state["reminder_days"] = [day]
+        return "send"
+    if day in sim_state["reminder_days"]:
+        return "suppress_same_day"
+    sim_state["reminder_days"].append(day)
+    if len(sim_state["reminder_days"]) > 3:
+        return "exhausted"
+    return "send"
+
+
 # --- structured escalation handoff ------------------------------------------
 
 
@@ -361,10 +480,16 @@ def _resolve_escalation_reason(
     """The two distinct escalation triggers, in priority order: an explicit
     human demand always wins regardless of attempt count; otherwise the real
     stopping-rule ceilings (imported, never redefined); otherwise a plain
-    'agent decided it's out of scope' escalation."""
+    'agent decided it's out of scope' escalation.
+
+    The attempts-exceeded ceiling must never fire when `base_outcome` is
+    already a positive outcome for *this turn* ("ptp_promised" or
+    "resolved") -- those are never silently overridden into "escalated" just
+    because this happened to be the Nth exchange (S10 bugfix: a customer
+    agreeing to pay was previously clobbered into escalated same-turn)."""
     if human_requested:
         return "customer_requested_human"
-    if (
+    if base_outcome not in ("ptp_promised", "resolved") and (
         sim_state["attempts_so_far"] >= MAX_RETRY_ATTEMPTS
         or sim_state["escalation_stage"] >= MAX_ESCALATION_STAGE
     ):
@@ -372,6 +497,113 @@ def _resolve_escalation_reason(
     if base_outcome == "escalated":
         return "out_of_scope"
     return None
+
+
+# --- S11: deterministic clear-agreement backstop over the LLM's own outcome -
+# A real transcript showed the customer say an unambiguous "okay" after the
+# agent offered the payment link, yet the LLM's own `outcome` judgment stayed
+# "ongoing" -- silently discarding a deterministic signal this file already
+# computes for the fallback path. This backstop runs AFTER the LLM call (or
+# fallback) has produced `result`, and BEFORE `_apply_turn_state_machine`, so
+# an overridden "ptp_promised" flows through the PTP state machine exactly
+# like an LLM-native one would.
+
+
+def _apply_agreement_override(
+    result: dict[str, Any], message: str, persona: dict[str, Any]
+) -> dict[str, Any]:
+    if result.get("outcome") != "ongoing" or not _is_clear_agreement(message):
+        return result
+    reply = result.get("reply", "")
+    offers_link = any(w in reply.lower() for w in _PAYMENT_LINK_WORDS)
+    return {
+        **result,
+        "outcome": "ptp_promised",
+        "reply": reply if offers_link else _ptp_confirmation_reply(persona),
+        "reasoning": (
+            "Customer's unambiguous agreement to pay confirmed as Promise-to-Pay, "
+            "overriding a non-committal model response."
+        ),
+    }
+
+
+# --- turn-level state machine: PTP suspension + reminder cadence (S10) -----
+
+
+def _activate_ptp_if_needed(sim_state: dict[str, Any], result: dict[str, Any]) -> dict[str, Any]:
+    """When an outcome transitions TO "ptp_promised" for the first time,
+    start the promise's own timer (decoupled from the attempts ladder) and
+    tell the customer a real calendar-style due date."""
+    if result["outcome"] == "resolved":
+        sim_state["ptp_active"] = False
+        return result
+    if result["outcome"] != "ptp_promised" or sim_state.get("ptp_active"):
+        return result
+    offset_days = 5
+    sim_state["ptp_active"] = True
+    sim_state["ptp_target_day"] = sim_state["sim_day"] + offset_days
+    label = _format_calendar_date(datetime.now(timezone.utc) + timedelta(days=offset_days))
+    sim_state["ptp_target_date_label"] = label
+    return {
+        **result,
+        "reply": (
+            f"{result['reply']} Agar {label} tak payment complete nahi hota, to yeh case "
+            "human review team ko bhej diya jayega."
+        ),
+    }
+
+
+def _apply_turn_state_machine(
+    sim_state: dict[str, Any], *, human_requested: bool, result: dict[str, Any]
+) -> tuple[dict[str, Any], str | None, bool]:
+    """Mutates `sim_state` in place; returns `(result, escalation_reason,
+    suppressed)`.
+
+    While a PTP is active, the normal attempts/escalation-stage ladder is
+    suspended entirely -- more turns happening must never auto-escalate a
+    promise-to-pay. Only an explicit human demand, the promise going overdue
+    (`sim_day >= ptp_target_day`), or the base result itself already being
+    "escalated" (e.g. a genuinely out-of-scope ask) can end it early.
+
+    Outside a PTP, the existing attempts-ladder escalation applies, followed
+    by the reminder-cadence gate (only meaningful while the outcome is still
+    "ongoing" -- a resolution/PTP/escalation/halt this turn is not "just
+    another reminder" and bypasses the gate entirely).
+    """
+    escalation_reason: str | None = None
+    suppressed = False
+
+    if sim_state.get("ptp_active"):
+        if human_requested:
+            escalation_reason = "customer_requested_human"
+        elif sim_state["sim_day"] >= sim_state["ptp_target_day"] and result["outcome"] != "resolved":
+            escalation_reason = "ptp_overdue"
+        elif result["outcome"] == "escalated":
+            escalation_reason = "out_of_scope"
+        if escalation_reason:
+            sim_state["ptp_active"] = False
+            result = {**result, "outcome": "escalated"}
+    else:
+        sim_state["attempts_so_far"] += 1
+        if sim_state["escalation_stage"] < MAX_ESCALATION_STAGE:
+            sim_state["escalation_stage"] += 1
+
+        escalation_reason = _resolve_escalation_reason(
+            human_requested=human_requested, sim_state=sim_state, base_outcome=result["outcome"]
+        )
+        if escalation_reason:
+            result = {**result, "outcome": "escalated"}
+        elif result["outcome"] == "ongoing":
+            cta = _classify_reminder_cta(result["reply"])
+            gate = _reminder_gate(sim_state, cta, sim_state["sim_day"])
+            if gate == "suppress_same_day":
+                suppressed = True
+            elif gate == "exhausted":
+                escalation_reason = "reminders_exhausted"
+                result = {**result, "outcome": "escalated"}
+
+    result = _activate_ptp_if_needed(sim_state, result)
+    return result, escalation_reason, suppressed
 
 
 # --- system prompts --------------------------------------------------------
@@ -513,6 +745,17 @@ _OUT_OF_SCOPE_WORDS = {
 }
 _QUESTION_WORDS = {"kyu", "why", "kaise", "reason", "kya hua", "fail", "problem", "issue", "batao", "bataiye", "detail", "explain", "samjhao"}
 _AGREE_PHRASES = {"pay kar", "link bhej", "bhej do", "bhejo", "kar deta hoon", "karta hoon", "kar dunga", "ready to pay", "sure send", "yes send", "send link", "paid", "payment kar"}
+_BARE_AGREEMENT_WORDS = {"haan", "yes", "theek hai", "ok", "okay", "sure", "done"}
+
+# S11: an "are you a bot / are you real" style question is a genuine, honest
+# question about identity -- not a failure-related inquiry -- and must not
+# recycle the (byte-identical, zero-variation) root-cause explanation branch.
+_IDENTITY_WORDS = {"bot", "robot", "ai ho", "insaan ho", "real hai", "machine", "human ho", "asli ho"}
+
+# S11: a domain-signal set so a bare "?" alone no longer force-fires the
+# root-cause explanation for unrelated questions -- it must be accompanied by
+# an actual failure/payment-related cue.
+_FAILURE_DOMAIN_WORDS = {"fail", "kyu", "kaise", "payment", "transaction", "otp", "card", "bank", "link"}
 
 # alternate phrasings for the deterministic fallback's two most-repeatable
 # lines (the generic "keep waiting" nudge and the stalled hand-off) -- the
@@ -536,6 +779,31 @@ def _alternate_phrasing(reply_text: str, persona: dict[str, Any], turn_index: in
         if v != reply_text:
             return v
     return variants[turn_index % len(variants)]
+
+
+def _is_clear_agreement(text: str) -> bool:
+    """S11: the deterministic "customer clearly agreed to pay" signal,
+    extracted out of `_fallback_agent_reply` branch 5 so it can also act as a
+    backstop over an LLM's own (sometimes wrong) outcome judgment. A bare
+    agreement word only counts when the message isn't *also* a question
+    ("yes, but why did it fail?" must NOT count) -- same semantics as the
+    fallback path's `has_question` guard, exactly preserved."""
+    t = text.lower().strip()
+    if any(p in t for p in _AGREE_PHRASES):
+        return True
+    has_question = any(w in t for w in _QUESTION_WORDS) or "?" in t
+    return t in _BARE_AGREEMENT_WORDS and not has_question
+
+
+def _ptp_confirmation_reply(persona: dict[str, Any]) -> str:
+    """The canned Promise-to-Pay confirmation line, shared by
+    `_fallback_agent_reply` branch 5 and the S11 clear-agreement override so
+    the wording never drifts between the two call sites."""
+    return (
+        f"Shukriya {persona['name']} ji! Maine Rs {persona['amount']} ka secure Razorpay payment "
+        f"link bhej diya hai: https://rzp.io/i/rec_{persona.get('amount', 0)}. Aapka Promise-to-Pay "
+        "log ho gaya hai. Link par click karke payment complete karte hi receipt mil jayegi."
+    )
 
 
 def _fallback_agent_reply(
@@ -567,8 +835,24 @@ def _fallback_agent_reply(
             "reasoning": "Out-of-scope inquiry (no context for discounts, refunds, or delivery); offering human escalation.",
         }
 
+    # 3.5. Identity / "are you a bot" style questions -- an honest, on-topic
+    # answer, never the recycled root-cause explanation (S11: a real
+    # transcript showed "Are you a bot?" mis-firing branch 4's canned line
+    # verbatim just because it contained a "?").
+    if any(w in text for w in _IDENTITY_WORDS):
+        return {
+            "reply": (
+                "Main Razorpay ka automated Recovery Assistant hoon, aapki payment ke baare mein "
+                "madad kar raha hoon -- agar chahen to main ek human colleague ko bhi jodh sakta hoon."
+            ),
+            "outcome": "ongoing",
+            "reasoning": "Customer asked whether this is a bot/AI; gave an honest identity answer, no escalation just for asking.",
+        }
+
     # 4. Questions asking why it failed / inquiry ("kyu hua", "fail kyu hua", "why")
-    has_question = any(w in text for w in _QUESTION_WORDS) or "?" in text
+    has_question = any(w in text for w in _QUESTION_WORDS) or (
+        "?" in text and any(w in text for w in _FAILURE_DOMAIN_WORDS)
+    )
     if has_question:
         rc = persona.get("root_cause") or RootCause.UNKNOWN
         explanation = _ROOT_CAUSE_EXPLANATIONS.get(rc, "Gateway par temporary network error aaya tha.")
@@ -579,12 +863,9 @@ def _fallback_agent_reply(
         }
 
     # 5. Genuine agreement to pay / proceed -> Promise to Pay (PTP)
-    has_agreement = any(p in text for p in _AGREE_PHRASES) or (
-        text in {"haan", "yes", "theek hai", "ok", "okay", "sure", "done"} and not has_question
-    )
-    if has_agreement:
+    if _is_clear_agreement(text):
         return {
-            "reply": f"Shukriya {persona['name']} ji! Maine Rs {persona['amount']} ka secure Razorpay payment link bhej diya hai: https://rzp.io/i/rec_{persona.get('amount', 0)}. Aapka Promise-to-Pay log ho gaya hai. Link par click karke payment complete karte hi receipt mil jayegi.",
+            "reply": _ptp_confirmation_reply(persona),
             "outcome": "ptp_promised",
             "reasoning": "Customer committed to pay; Payment Link dispatched; Promise-to-Pay recorded (max 3 reminders scheduled).",
         }
@@ -762,15 +1043,27 @@ def send_message(
         except Exception:
             pass
 
-    st["attempts_so_far"] += 1
-    if st["escalation_stage"] < MAX_ESCALATION_STAGE:
-        st["escalation_stage"] += 1
+    result = _apply_agreement_override(result, message, persona)
 
-    escalation_reason = _resolve_escalation_reason(
-        human_requested=human_requested, sim_state=st, base_outcome=result["outcome"]
+    result, escalation_reason, suppressed = _apply_turn_state_machine(
+        st, human_requested=human_requested, result=result
     )
-    if escalation_reason:
-        result = {**result, "outcome": "escalated"}
+
+    if suppressed:
+        # Cadence guard: an identical reminder ask was already sent today --
+        # don't render a fresh duplicate bubble. Smaller/cleaner than
+        # inventing a new return shape: just don't append a new agent turn
+        # this call (equivalent in spirit to advance_conversation's
+        # no_response shape), still advance the clock normally.
+        _bump_clock(st, natural_pause=is_deferral)
+        return {
+            "turn": None,
+            "outcome": "ongoing",
+            "reasoning": "reminder suppressed: identical ask already sent today (cadence guard)",
+            "history": new_history,
+            "sim_state": st,
+            "suppressed": True,
+        }
 
     reply_text = result["reply"]
     if reply_text == st.get("last_reply_text"):
@@ -865,15 +1158,28 @@ def advance_conversation(
         except Exception:
             pass
 
-    st["attempts_so_far"] += 1
-    if st["escalation_stage"] < MAX_ESCALATION_STAGE:
-        st["escalation_stage"] += 1
+    agent_result = _apply_agreement_override(agent_result, customer_text, persona)
 
-    escalation_reason = _resolve_escalation_reason(
-        human_requested=human_requested, sim_state=st, base_outcome=agent_result["outcome"]
+    agent_result, escalation_reason, suppressed = _apply_turn_state_machine(
+        st, human_requested=human_requested, result=agent_result
     )
-    if escalation_reason:
-        agent_result = {**agent_result, "outcome": "escalated"}
+
+    if suppressed:
+        # Cadence guard: an identical reminder ask was already sent today --
+        # skip the redundant agent turn this call (the customer's own turn
+        # still happened and is kept), equivalent in spirit to the
+        # no_response shape above -- no fresh duplicate bubble is rendered.
+        _bump_clock(st, natural_pause=is_deferral)
+        return {
+            "no_response": False,
+            "customer_turn": _with_audio(customer_turn, channel, s),
+            "agent_turn": None,
+            "outcome": "ongoing",
+            "reasoning": "reminder suppressed: identical ask already sent today (cadence guard)",
+            "history": history_with_customer,
+            "sim_state": st,
+            "suppressed": True,
+        }
 
     reply_text = agent_result["reply"]
     if reply_text == st.get("last_reply_text"):
@@ -983,6 +1289,7 @@ def click_payment_link(
     captured = bool(capture["captured"])
     reason = capture["reason"]
     amount = capture["amount"]
+    escalation_reason: str | None = None
 
     if captured:
         tx_id = f"pay_sim_{event.event_id[-6:].replace('_', '')}{random.randint(100, 999)}"
@@ -996,21 +1303,42 @@ def click_payment_link(
             f"(fake gateway capture, attempt {attempt}, link {link_id})."
         )
         payment_id: str | None = tx_id
+        # The promise was honored -- clear it (S10). No-op if it wasn't active.
+        st["ptp_active"] = False
+    elif st.get("ptp_active"):
+        # A payment attempt made after a Promise-to-Pay is outstanding just
+        # explicitly failed -- escalate immediately regardless of reason or
+        # attempt count (S10); this composes with forced_reason the same as
+        # a randomly-rolled failure would.
+        st["ptp_active"] = False
+        reply_text = _CAPTURE_FAILURE_TEXT.get(
+            reason, "Payment link attempt fail ho gaya, ek baar phir try karte hain."
+        )
+        payment_id = None
+        outcome = "escalated"
+        escalation_reason = "ptp_payment_failed"
+        reasoning = (
+            f"Payment attempt failed ({reason}) while a Promise-to-Pay was outstanding; "
+            "escalating to human review."
+        )
     elif reason == "insufficient_funds":
         # Carve-out (S9): insufficient funds never escalates no matter how
-        # many attempts -- instead we schedule a salary-day reminder. sim_day
-        # is a relative counter, not a calendar date, so `+5` is a bounded,
-        # deterministic sandbox approximation of recovery.SALARY_WINDOW_DAY.
+        # many attempts -- instead we schedule a reminder. `sim_day` is a
+        # relative counter (internal gating only); the customer-facing
+        # message shows a real calendar-style date instead (S10), using
+        # recovery._next_salary_window since this specifically simulates the
+        # salary-credit-window concept.
         st["salary_reminder_day"] = st["sim_day"] + 5
+        label = _format_calendar_date(_next_salary_window(datetime.now(timezone.utc)))
+        st["salary_reminder_date_label"] = label
         reply_text = (
             f"{_CAPTURE_FAILURE_TEXT['insufficient_funds']} Filhaal aapke account mein balance kam "
-            f"hai. Main aapko salary credit ke around, Day {st['salary_reminder_day']}, dobara "
-            f"reminder bhejunga."
+            f"hai. Main aapko salary credit ke around, {label}, dobara reminder bhejunga."
         )
         outcome = "ongoing"
         reasoning = (
-            f"Payment failed: insufficient funds; rescheduled reminder to sim day "
-            f"{st['salary_reminder_day']} (salary-credit-window analogue), no escalation."
+            f"Payment failed: insufficient funds; rescheduled reminder to {label} "
+            "(salary-credit-window analogue), no escalation."
         )
         payment_id = None
         _advance_day(st)
@@ -1021,6 +1349,7 @@ def click_payment_link(
         payment_id = None
         if attempt >= 3:
             outcome = "escalated"
+            escalation_reason = "max_attempts_exceeded"
             reasoning = f"Payment link failed 3 times ({reason}); handing off, capture attempts exhausted."
         else:
             outcome = "ongoing"
@@ -1042,7 +1371,9 @@ def click_payment_link(
         "sim_state": st,
     }
     if outcome == "escalated":
-        result["escalation"] = _build_escalation(event, st, new_history, "max_attempts_exceeded", s)
+        result["escalation"] = _build_escalation(
+            event, st, new_history, escalation_reason or "max_attempts_exceeded", s
+        )
     return result
 
 

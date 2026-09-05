@@ -130,8 +130,12 @@ const renderOutcomeBadge = (outcome: PlaygroundOutcome) => {
 }
 
 const renderRemindersMetric = (outcome: PlaygroundOutcome, simState: PlaygroundSimState | null) => {
-  const remindersScheduled = outcome === 'ptp_promised' ? 1 : simState?.sim_day && simState.sim_day > 1 ? Math.min(3, simState.sim_day) : 1
   const maxReminders = 3
+  // Reflects the backend's real reminder-cadence gate (distinct days the
+  // current CTA has been sent on), not a guess from sim_day. Moot during a
+  // PTP wait — no automated nudges are sent while ptp_active, so the cap
+  // just shows what had accrued before the promise paused it.
+  const remindersScheduled = Math.min(maxReminders, simState?.reminder_days?.length ?? 0)
   const remaining = Math.max(0, maxReminders - remindersScheduled)
 
   return (
@@ -142,6 +146,7 @@ const renderRemindersMetric = (outcome: PlaygroundOutcome, simState: PlaygroundS
       <span>📬</span>
       <span>
         Reminders Cap: <strong className="text-white font-bold">{remindersScheduled}/{maxReminders}</strong> ({remaining} left)
+        {outcome === 'ptp_promised' && <span className="text-amber-300"> · paused (PTP)</span>}
       </span>
       <span className="text-[10px] text-blue-300/80 hidden sm:inline">(Replies unmetered)</span>
     </span>
@@ -152,6 +157,9 @@ const ESCALATION_REASON_LABEL: Record<string, string> = {
   customer_requested_human: 'Customer explicitly asked for a human',
   out_of_scope: 'Request is outside the agent’s bounded authority',
   max_attempts_exceeded: 'Stopping rule reached — max attempts/escalation stage',
+  ptp_overdue: 'Promise-to-Pay date passed without payment (overdue)',
+  ptp_payment_failed: 'Payment attempt after Promise-to-Pay failed',
+  reminders_exhausted: 'Automated reminder cap reached (3 reminders, no response)',
 }
 
 const FAILURE_REASON_LABEL: Record<string, string> = {
@@ -239,7 +247,7 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
   const [speechSupported, setSpeechSupported] = useState(false)
   const [baseTrail, setBaseTrail] = useState<AuditRead[]>([])
   const [simulatedEvents, setSimulatedEvents] = useState<UnifiedAuditNode[]>([])
-  const [ticketStatus, setTicketStatus] = useState<'none' | 'ptp_human_review' | 'recovered'>('none')
+  const [ticketStatus, setTicketStatus] = useState<'none' | 'ptp_pending' | 'human_review' | 'recovered'>('none')
   const [phoneView, setPhoneView] = useState<'chat' | 'checkout'>('chat')
 
   const drawerRef = useRef<HTMLDivElement>(null)
@@ -607,23 +615,26 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
     nextEscalation?: PlaygroundEscalation,
   ) => {
     if (next !== outcome) {
-      if (next === 'ptp_promised') {
+      if (next === 'ptp_promised' && ticketStatus !== 'ptp_pending') {
+        const dateLabel = nextSimState?.ptp_target_date_label || 'an upcoming date'
         logSimulatedEvent(
           'customer',
           'customer_promised_to_pay',
-          'Customer committed to settlement date; payment link generated & sent',
-          { promisedDate: simState ? `Day ${simState.sim_day + 2}` : 'Upcoming cycle' },
+          `Customer committed to pay by ${dateLabel}; payment link generated & sent`,
+          { promisedDate: dateLabel },
         )
-        setTicketStatus('ptp_human_review')
+        setTicketStatus('ptp_pending')
         logSimulatedEvent(
           'triage',
-          'ticket_opened_ptp',
-          'Simulated ticket opened (reason: promise-to-pay) — case routed to human review queue until payment settles',
+          'ptp_recorded',
+          `Promise-to-Pay recorded, due ${dateLabel} — automated reminders paused; not routed to a human unless the promise breaks`,
         )
       } else if (next === 'escalated') {
+        const wasPtp = ticketStatus === 'ptp_pending'
+        setTicketStatus('human_review')
         logSimulatedEvent(
           'triage',
-          'escalation_triggered',
+          wasPtp ? 'ptp_broken' : 'escalation_triggered',
           `Escalated to human review queue: ${nextEscalation?.reason ? nextEscalation.reason.replace(/_/g, ' ') : why}`,
           undefined,
           nextEscalation ? { reason: nextEscalation.reason, summary: nextEscalation.conversation_summary } : undefined,
@@ -634,12 +645,12 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
           'halted_stopping_rule',
           `Safety rule triggered: ${why}`,
         )
-      } else if (next === 'resolved' && ticketStatus === 'ptp_human_review') {
+      } else if (next === 'resolved' && ticketStatus !== 'none') {
         setTicketStatus('recovered')
         logSimulatedEvent(
           'triage',
           'ticket_closed_recovered',
-          'Customer completed payment — simulated ticket closed and removed from human review queue',
+          'Customer completed payment — simulated ticket closed and removed from the queue',
         )
       }
     }
@@ -777,17 +788,26 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
         speaker: 'customer',
         sim_state: simState ?? undefined,
       })
-      recordTurnTimestamp(prevLen + 1, currentDay, currentHour, 4)
       setHistory(res.history)
       setInput('')
-      playTurnVoice(res.turn as TurnWithAudio, res.history.length - 1)
-      const agentText = cleanTurnText(res.turn?.text)
-      if (agentText) {
+      if (res.suppressed || !res.turn) {
+        if (res.sim_state) setSimState(res.sim_state)
         logSimulatedEvent(
           'recovery',
-          'sent_nudge',
-          `Recovery agent replied: "${agentText}"`,
+          'reminder_suppressed',
+          'Same reminder already sent today — cadence guard held off a duplicate (max 3 reminders, 24h cooldown)',
         )
+      } else {
+        recordTurnTimestamp(prevLen + 1, currentDay, currentHour, 4)
+        playTurnVoice(res.turn as TurnWithAudio, res.history.length - 1)
+        const agentText = cleanTurnText(res.turn.text)
+        if (agentText) {
+          logSimulatedEvent(
+            'recovery',
+            'sent_nudge',
+            `Recovery agent replied: "${agentText}"`,
+          )
+        }
       }
       applyOutcome(res.outcome, res.reasoning, res.sim_state, res.escalation)
     } catch (err) {
@@ -830,14 +850,8 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
         return
       }
 
-      recordTurnTimestamp(prevLen, currentDay, currentHour, 2)
-      recordTurnTimestamp(prevLen + 1, currentDay, currentHour, 5)
-
       setHistory(res.history)
       if (res.sim_state) setSimState(res.sim_state)
-
-      const customerIdx = res.history.length - 2
-      const agentIdx = res.history.length - 1
 
       const customerText = cleanTurnText(res.customer_turn?.text)
       if (customerText) {
@@ -848,25 +862,45 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
           { customerText },
         )
       }
-      const agentText = cleanTurnText(res.agent_turn?.text)
-      if (agentText) {
+
+      if (res.suppressed || !res.agent_turn) {
+        recordTurnTimestamp(prevLen, currentDay, currentHour, 2)
         logSimulatedEvent(
           'recovery',
-          'sent_nudge',
-          `Agent outreach turn: "${agentText}"`,
+          'reminder_suppressed',
+          'Same reminder already sent today — cadence guard held off a duplicate (max 3 reminders, 24h cooldown)',
         )
-      }
-
-      playTurnVoice(res.customer_turn as TurnWithAudio, customerIdx, () => {
-        if (autoPlayAbortRef.current) return
-        setTimeout(() => {
+        const customerIdx = res.history.length - 1
+        playTurnVoice(res.customer_turn as TurnWithAudio, customerIdx, () => {
           if (autoPlayAbortRef.current) return
-          playTurnVoice(res.agent_turn as TurnWithAudio, agentIdx, () => {
+          applyOutcome(res.outcome, res.reasoning, res.sim_state, res.escalation)
+        })
+      } else {
+        recordTurnTimestamp(prevLen, currentDay, currentHour, 2)
+        recordTurnTimestamp(prevLen + 1, currentDay, currentHour, 5)
+
+        const customerIdx = res.history.length - 2
+        const agentIdx = res.history.length - 1
+        const agentText = cleanTurnText(res.agent_turn?.text)
+        if (agentText) {
+          logSimulatedEvent(
+            'recovery',
+            'sent_nudge',
+            `Agent outreach turn: "${agentText}"`,
+          )
+        }
+
+        playTurnVoice(res.customer_turn as TurnWithAudio, customerIdx, () => {
+          if (autoPlayAbortRef.current) return
+          setTimeout(() => {
             if (autoPlayAbortRef.current) return
-            applyOutcome(res.outcome, res.reasoning, res.sim_state, res.escalation)
-          })
-        }, 400)
-      })
+            playTurnVoice(res.agent_turn as TurnWithAudio, agentIdx, () => {
+              if (autoPlayAbortRef.current) return
+              applyOutcome(res.outcome, res.reasoning, res.sim_state, res.escalation)
+            })
+          }, 400)
+        })
+      }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'The conversation could not advance')
     } finally {
@@ -914,16 +948,10 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
           continue
         }
 
-        recordTurnTimestamp(prevLen, currentDay, currentHour, 2)
-        recordTurnTimestamp(prevLen + 1, currentDay, currentHour, 5)
-
         current = res.history
         st = res.sim_state ?? st
         setHistory(res.history)
         if (res.sim_state) setSimState(res.sim_state)
-
-        const customerIdx = res.history.length - 2
-        const agentIdx = res.history.length - 1
 
         const customerText = cleanTurnText(res.customer_turn?.text)
         if (customerText) {
@@ -934,25 +962,46 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
             { customerText },
           )
         }
-        const agentText = cleanTurnText(res.agent_turn?.text)
-        if (agentText) {
+
+        if (res.suppressed || !res.agent_turn) {
+          recordTurnTimestamp(prevLen, currentDay, currentHour, 2)
           logSimulatedEvent(
             'recovery',
-            'sent_nudge',
-            `Agent outreach turn: "${agentText}"`,
+            'reminder_suppressed',
+            'Same reminder already sent today — cadence guard held off a duplicate (max 3 reminders, 24h cooldown)',
           )
+          const customerIdx = res.history.length - 1
+          await playTurnVoiceAsync(res.customer_turn as TurnWithAudio, customerIdx)
+          if (autoPlayAbortRef.current) break
+          applyOutcome(res.outcome, res.reasoning, res.sim_state, res.escalation)
+        } else {
+          recordTurnTimestamp(prevLen, currentDay, currentHour, 2)
+          recordTurnTimestamp(prevLen + 1, currentDay, currentHour, 5)
+
+          const customerIdx = res.history.length - 2
+          const agentIdx = res.history.length - 1
+          const agentText = cleanTurnText(res.agent_turn?.text)
+          if (agentText) {
+            logSimulatedEvent(
+              'recovery',
+              'sent_nudge',
+              `Agent outreach turn: "${agentText}"`,
+            )
+          }
+
+          await playTurnVoiceAsync(res.customer_turn as TurnWithAudio, customerIdx)
+          if (autoPlayAbortRef.current) break
+          await new Promise((r) => setTimeout(r, 400))
+          if (autoPlayAbortRef.current) break
+
+          await playTurnVoiceAsync(res.agent_turn as TurnWithAudio, agentIdx)
+          if (autoPlayAbortRef.current) break
+          applyOutcome(res.outcome, res.reasoning, res.sim_state, res.escalation)
         }
 
-        await playTurnVoiceAsync(res.customer_turn as TurnWithAudio, customerIdx)
-        if (autoPlayAbortRef.current) break
-        await new Promise((r) => setTimeout(r, 400))
-        if (autoPlayAbortRef.current) break
-
-        await playTurnVoiceAsync(res.agent_turn as TurnWithAudio, agentIdx)
-        if (autoPlayAbortRef.current) break
-        applyOutcome(res.outcome, res.reasoning, res.sim_state, res.escalation)
-
-        if (res.outcome !== 'ongoing') break
+        // A Promise-to-Pay is a wait, not a stop -- keep auto-running through
+        // it so the tester can watch it resolve (payment) or go overdue.
+        if (res.outcome !== 'ongoing' && res.outcome !== 'ptp_promised') break
       }
     } catch (err) {
       setError(err instanceof Error ? err.message : 'The conversation could not advance')
@@ -965,6 +1014,11 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
 
   const isCall = channel === 'call'
   const isAiMode = mode === 'ai' || mode === 'auto'
+  // A Promise-to-Pay is a wait, not an end state — the tester must still be
+  // able to advance turns/days to see it either get paid or go overdue.
+  // Only a genuinely terminal outcome (resolved/escalated/halted) locks the
+  // conversation.
+  const isActionable = outcome === 'ongoing' || outcome === 'ptp_promised'
 
   return (
     <div className="fixed inset-0 z-50 flex items-stretch justify-center bg-black/80 backdrop-blur-md animate-fade-in p-0 md:p-2 lg:p-3">
@@ -1502,14 +1556,14 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
                           value={input}
                           onChange={(e) => setInput(e.target.value)}
                           placeholder="Type a message to agent..."
-                          disabled={busy || outcome !== 'ongoing'}
+                          disabled={busy || !isActionable}
                           className="flex-1 px-3.5 py-2 rounded-full bg-[#2a3942] text-white text-xs placeholder-slate-400 focus:outline-none focus:ring-1 focus:ring-emerald-500"
                         />
                         {speechSupported && (
                           <button
                             type="button"
                             onClick={isListening ? stopListening : startListening}
-                            disabled={busy || outcome !== 'ongoing'}
+                            disabled={busy || !isActionable}
                             className={`p-2 rounded-full text-xs font-bold transition-colors cursor-pointer shrink-0 ${
                               isListening ? 'bg-red-500 text-white animate-pulse' : 'bg-[#2a3942] text-slate-300 hover:text-white'
                             }`}
@@ -1520,7 +1574,7 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
                         )}
                         <button
                           type="submit"
-                          disabled={busy || !input.trim() || outcome !== 'ongoing'}
+                          disabled={busy || !input.trim() || !isActionable}
                           className="w-8 h-8 rounded-full bg-[#00a884] hover:bg-[#008f6f] text-white flex items-center justify-center disabled:opacity-40 cursor-pointer shrink-0 transition-all shadow"
                           title="Send message"
                         >
@@ -1573,18 +1627,34 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
                   )}
                 </div>
 
-                {/* Ticket status banner — PTP hand-off to a simulated human-review queue */}
+                {/* Ticket status banner — a Promise-to-Pay is its own track, separate
+                    from human review; it only escalates if it goes overdue or a
+                    post-PTP payment attempt fails (never just from more turns). */}
                 {ticketStatus !== 'none' && (
                   <div
                     className={`p-3 rounded-xl liquid-glass-card border text-xs flex items-center gap-2 ${
-                      ticketStatus === 'ptp_human_review' ? 'border-amber-500/40' : 'border-emerald-500/40'
+                      ticketStatus === 'ptp_pending'
+                        ? 'border-amber-500/40'
+                        : ticketStatus === 'human_review'
+                          ? 'border-rose-500/40'
+                          : 'border-emerald-500/40'
                     }`}
                   >
-                    <span className={`w-2 h-2 rounded-full ${ticketStatus === 'ptp_human_review' ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'}`} />
+                    <span
+                      className={`w-2 h-2 rounded-full ${
+                        ticketStatus === 'ptp_pending'
+                          ? 'bg-amber-400 animate-pulse'
+                          : ticketStatus === 'human_review'
+                            ? 'bg-rose-400'
+                            : 'bg-emerald-400'
+                      }`}
+                    />
                     <span className="font-semibold text-white">
-                      {ticketStatus === 'ptp_human_review'
-                        ? 'Simulated Ticket: PTP — Routed to Human Review'
-                        : 'Simulated Ticket: Recovered — Removed from Human Review'}
+                      {ticketStatus === 'ptp_pending'
+                        ? `Promise to Pay — Awaiting Settlement${simState?.ptp_target_date_label ? ` by ${simState.ptp_target_date_label}` : ''}`
+                        : ticketStatus === 'human_review'
+                          ? 'Escalated — Routed to Human Review'
+                          : 'Recovered — Removed from Queue'}
                     </span>
                   </div>
                 )}
@@ -1598,7 +1668,7 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
                     </div>
                     <button
                       onClick={advance}
-                      disabled={busy || outcome !== 'ongoing' || ticketStatus === 'ptp_human_review'}
+                      disabled={busy || !isActionable}
                       className="w-full py-2.5 px-3 rounded-xl bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white font-semibold text-xs transition-all shadow-md flex items-center justify-center gap-2 cursor-pointer"
                     >
                       <span>▶</span>
@@ -1606,7 +1676,7 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
                     </button>
                     <button
                       onClick={playToResolution}
-                      disabled={busy || outcome !== 'ongoing' || ticketStatus === 'ptp_human_review'}
+                      disabled={busy || !isActionable}
                       className="w-full py-2.5 px-3 rounded-xl bg-purple-900/60 hover:bg-purple-800/60 border border-purple-500/40 disabled:opacity-40 text-purple-200 font-semibold text-xs transition-all flex items-center justify-center gap-1.5 cursor-pointer"
                     >
                       <span>⚡</span>
@@ -1615,7 +1685,7 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
                     <button
                       type="button"
                       onClick={() => send('Can you give me a 50% discount code?')}
-                      disabled={busy || outcome !== 'ongoing' || ticketStatus === 'ptp_human_review'}
+                      disabled={busy || !isActionable}
                       className="w-full py-2 px-3 rounded-lg bg-amber-950/40 hover:bg-amber-900/50 border border-amber-500/40 text-amber-300 text-xs font-medium transition-colors text-left flex items-center justify-between cursor-pointer disabled:opacity-40"
                     >
                       <span>⚠️ Out-of-Scope Query</span>
@@ -1624,7 +1694,7 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
                     <button
                       type="button"
                       onClick={() => send('I want to talk to a human supervisor right now.')}
-                      disabled={busy || outcome !== 'ongoing' || ticketStatus === 'ptp_human_review'}
+                      disabled={busy || !isActionable}
                       className="w-full py-2 px-3 rounded-lg bg-rose-950/40 hover:bg-rose-900/50 border border-rose-500/40 text-rose-300 text-xs font-medium transition-colors text-left flex items-center justify-between cursor-pointer disabled:opacity-40"
                     >
                       <span>🚨 Force Human Escalation</span>
@@ -1636,11 +1706,11 @@ export const SimulateSession: React.FC<Props> = ({ eventId, isOpen, onClose }) =
                         interruptSpeech()
                         send('Haan main pakka 10th ko salary credit aane par pay kar dunga, please abhi remind mat karna.')
                       }}
-                      disabled={busy || outcome !== 'ongoing' || ticketStatus === 'ptp_human_review'}
+                      disabled={busy || !isActionable || ticketStatus === 'ptp_pending'}
                       className="w-full py-2 px-3 rounded-lg bg-emerald-950/40 hover:bg-emerald-900/50 border border-emerald-500/40 text-emerald-300 text-xs font-medium transition-colors text-left flex items-center justify-between cursor-pointer disabled:opacity-40"
                     >
                       <span>🤝 Record Promise to Pay (PTP)</span>
-                      <span className="text-[10px] opacity-75">Routes to Human Review</span>
+                      <span className="text-[10px] opacity-75">Pauses reminders, not human review</span>
                     </button>
                   </div>
                 ) : null}

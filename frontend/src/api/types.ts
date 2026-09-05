@@ -337,10 +337,31 @@ export interface PlaygroundSimState {
   outstanding_asks: string[]
   last_reply_text: string | null
   capture_attempts: number
-  /** 0 = not scheduled. Sandbox stand-in for `recovery.SALARY_WINDOW_DAY` — a
-   * relative sim_day the agent has promised to remind the customer again on,
-   * set after an `insufficient_funds` checkout failure (never escalates). */
+  /** 0 = not scheduled. Internal relative gating counter only — sandbox
+   * stand-in for `recovery.SALARY_WINDOW_DAY`, set after an
+   * `insufficient_funds` checkout failure (never escalates). The customer-
+   * facing date is `salary_reminder_date_label` below; never show this raw
+   * counter to a user. */
   salary_reminder_day?: number
+  /** Real calendar-style date shown to the customer (e.g. "1st October"). */
+  salary_reminder_date_label?: string
+  /** True from the turn a Promise-to-Pay is recorded until it resolves (paid)
+   * or breaks (overdue, or a post-PTP payment attempt fails). While true, the
+   * normal attempts/escalation-stage ladder is suspended — more turns
+   * happening must never auto-escalate a promise-to-pay. */
+  ptp_active?: boolean
+  /** Internal relative sim_day the promise is due (0 = unset) — gating only,
+   * never shown to a user; see `ptp_target_date_label`. */
+  ptp_target_day?: number
+  /** Real calendar-style date shown to the customer/tester for the PTP due date. */
+  ptp_target_date_label?: string
+  /** Reminder-cadence gate (pre-PTP nudge ladder only): a short tag for what
+   * the last reminder asked for ("" = none yet). A genuinely different ask
+   * resets the cadence cap below. */
+  reminder_cta?: string
+  /** Distinct sim_day values the *current* `reminder_cta` has already been
+   * sent on — same CTA on a 4th distinct day exhausts the reminder cap. */
+  reminder_days?: number[]
 }
 
 /** Tester-picked outcome at the embedded fake-checkout screen. `undefined`
@@ -356,6 +377,9 @@ export type PlaygroundEscalationReason =
   | 'customer_requested_human'
   | 'out_of_scope'
   | 'max_attempts_exceeded'
+  | 'ptp_overdue'
+  | 'ptp_payment_failed'
+  | 'reminders_exhausted'
 
 export interface PlaygroundEscalation {
   reason: PlaygroundEscalationReason
@@ -391,12 +415,17 @@ export interface PlaygroundStartResponse {
 }
 
 export interface PlaygroundMessageResponse {
-  turn: PlaygroundTurn
+  /** `null` when `suppressed` — a reminder-cadence guard (same ask already
+   * sent today) skipped adding a fresh duplicate turn this call. */
+  turn: PlaygroundTurn | null
   outcome: PlaygroundOutcome
   reasoning: string
   history: PlaygroundTurn[]
   sim_state?: PlaygroundSimState
   escalation?: PlaygroundEscalation
+  /** True when the reminder-cadence gate suppressed a same-day duplicate ask
+   * — `turn` is `null`, `history` doesn't gain a new agent turn this call. */
+  suppressed?: boolean
 }
 
 export interface PlaygroundAdvanceResponse {
@@ -410,6 +439,9 @@ export interface PlaygroundAdvanceResponse {
   history: PlaygroundTurn[]
   sim_state?: PlaygroundSimState
   escalation?: PlaygroundEscalation
+  /** True when the reminder-cadence gate suppressed a same-day duplicate ask
+   * — `agent_turn` is `null` this call (the customer's own turn still happened). */
+  suppressed?: boolean
 }
 
 export interface PlaygroundPayResponse {
